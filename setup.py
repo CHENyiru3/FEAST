@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="FEAST-py",
-    version="0.1.7",
+    version="1.0.1",
     author="Yiru CHEN",
     author_email="yiru.22@intl.zju.edu.cn",
     description="Spatial Transcriptomics Simulator",
