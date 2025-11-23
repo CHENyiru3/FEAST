@@ -117,9 +117,10 @@ interpolated_slices = interpolate_slices(
 Try FEAST with notebook! Comprehensive Jupyter notebooks are provided in the repository:
 
 - **[example_single_sim.ipynb](example_single_sim.ipynb)**: Basic single-slice simulation for both sequencing-based and imaging-based ST data
-  - Visualization of parameter clouds
-  - Quality evaluation metrics
-  - Expression alteration examples
+
+- **[example_interpolation.ipynb](example_interpolation.ipynb)**: Interpolation augumentation for MERFISH slices
+
+
 
 
 
