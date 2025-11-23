@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
-**FEAST** (Feature-space-based modeling of Spatial Transcriptomics) is a comprehensive computational framework for simulating and interpolating spatial transcriptomics (ST) data. By modeling gene expression through a "parameter cloud" - a latent manifold capturing mean, variance, and sparsity - FEAST generates high-fidelity synthetic ST slices with controllable biological and technical variations.
+**FEAST** (Feature-space-based modeling of Spatial Transcriptomics) is a comprehensive computational framework for simulating and interpolating spatial transcriptomics (ST) data. By modeling gene expression through a "parameter cloud" - a latent manifold capturing mean, variance, and sparsity - FEAST generates high-fidelity synthetic ST slices with controllable biological and technical variations. This work has been submitted to top conference in computational biology RECOMB 2026, and will release preprint soon.
 
 ## Key Features
 
@@ -121,7 +121,6 @@ Try FEAST with notebook! Comprehensive Jupyter notebooks are provided in the rep
   - Quality evaluation metrics
   - Expression alteration examples
 
-To get the datasets for tutorial, you can download via https://drive.google.com/drive/folders/1lOQasZ9nxIDIZwlqEQDCBY0kJaA7GwZD?usp=drive_link
 
 
 ## Architecture

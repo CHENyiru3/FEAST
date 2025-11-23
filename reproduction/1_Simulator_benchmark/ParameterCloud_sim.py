@@ -1,13 +1,3 @@
-"""
-Simulator Benchmark: Single-slice simulation using FEAST simulator.
-
-Usage:
-    python ParameterCloud_sim.py --input <dataset> --output <path>
-    
-Example:
-    python ParameterCloud_sim.py --input sim_dlpfc --output results/simulated.h5ad
-"""
-
 import sys
 import argparse
 from pathlib import Path
