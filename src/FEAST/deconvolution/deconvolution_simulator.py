@@ -26,7 +26,7 @@ class DeconvolutionSimulator:
                                    alpha: float = 0.01,
                                    cell_type_key: Optional[str] = None,
                                    # Single slice simulation parameters
-                                   sigma: float = 1.0,
+                                   sigma: float = 0,
                                    visualize_fits: bool = False,
                                    use_heuristic_search: bool = False,
                                    alteration_config: Optional[Any] = None,
@@ -50,8 +50,8 @@ class DeconvolutionSimulator:
         
         Single Slice Simulation Parameters:
         ----------------------------------
-        sigma : float, default=1.0
-            Spatial smoothness parameter for G-SRBA algorithm
+        sigma : float, default=0
+            Deterministic simulation compatibility parameter. Nonzero values are not supported.
         visualize_fits : bool, default=False
             Whether to show parameter fitting visualizations
         use_heuristic_search : bool, default=False
