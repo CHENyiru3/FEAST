@@ -66,8 +66,6 @@ if __name__ == "__main__":
             verbose=False,
             use_real_stats_directly=False,
             use_heuristic_search=True,
-            follower_sigma_factor=0,
-            sigma=0,
             min_accepted_error=0.0001,
             screening_pool_size=10000,
             assignment_weights = {'mean': 1, 'variance': 1, 'zero_prop': 1.0},
@@ -93,8 +91,6 @@ if __name__ == "__main__":
             verbose=False,
             use_real_stats_directly=False,
             use_heuristic_search=True,
-            follower_sigma_factor=0,
-            sigma=0,
             min_accepted_error=0.0001,
             screening_pool_size=10000,
             assignment_weights = {'mean': 1, 'variance': 1, 'zero_prop': 1.0},
@@ -119,8 +115,6 @@ if __name__ == "__main__":
             verbose=False,
             use_real_stats_directly=False,
             use_heuristic_search=True,
-            follower_sigma_factor=0,
-            sigma=0,
             min_accepted_error=0.0001,
             screening_pool_size=10000,
             assignment_weights = {'mean': 1, 'variance': 1, 'zero_prop': 1.0},
@@ -135,6 +129,3 @@ if __name__ == "__main__":
     print("  - Variance-only: variance_only_fc_*.h5ad (8 conditions)")
     print("  - Sparsity-only: sparsity_only_fc_*.h5ad (9 conditions)")
     print("  - Total: 26 simulation files")
-
-
-        
