@@ -5,12 +5,6 @@ import pandas as pd
 
 from .parameter_cloud import GeneParameterSimulator, convert_params_for_new_simulator
 
-def _validate_sigma_removed(sigma):
-    if sigma is None:
-        return
-    if float(sigma) != 0.0:
-        raise ValueError("Stochastic G-SRBA/G-SBGA noise mode was removed; use sigma=0 or sigma=None.")
-
 
 def safe_calculate_qc_metrics(adata, verbose=False):
     try:
@@ -117,11 +111,9 @@ class SpatialSimulator:
         """Get current model parameters."""
         return self._model_params
     
-    def simulate(self, sigma: float = 0, follower_sigma_factor: float = 0, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.0, boundary_multiplier: float = 1.1) -> ad.AnnData:
+    def simulate(self, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.0, boundary_multiplier: float = 1.1) -> ad.AnnData:
         """
         Args:
-            sigma (float): Compatibility parameter. Only ``0`` or ``None`` is supported.
-            follower_sigma_factor (float): Legacy compatibility parameter, ignored.
             num_simulation_cores (int): Number of cores for simulation (legacy parameter).
             verbose (bool): If True, prints progress updates.
             clip_overshoot_factor (float): Factor to clip max expression values relative to reference.
@@ -129,7 +121,6 @@ class SpatialSimulator:
         """
         if self._model_params is None:
             raise ValueError("Model parameters not set. Call fit_model() first or provide model_params in constructor.")
-        _validate_sigma_removed(sigma)
         
         if verbose:
             print("Generating simulated data with deterministic rank preservation...")
@@ -137,8 +128,6 @@ class SpatialSimulator:
         simulated_adata = self._apply_deterministic_rank_assignment(
             reference_adata=self.reference_adata,
             model_params=self._model_params,
-            sigma=sigma,
-            follower_sigma_factor=follower_sigma_factor,
             verbose=verbose,
             clip_overshoot_factor=clip_overshoot_factor,
             boundary_multiplier=boundary_multiplier
@@ -150,9 +139,8 @@ class SpatialSimulator:
         safe_calculate_qc_metrics(simulated_adata)
         return simulated_adata
     
-    def _apply_deterministic_rank_assignment(self, reference_adata, model_params, sigma=0, follower_sigma_factor=0, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, n_modules=30, n_neighbors=6):
+    def _apply_deterministic_rank_assignment(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, n_modules=30, n_neighbors=6):
         """Generate counts from model parameters while preserving per-gene reference ranks."""
-        _validate_sigma_removed(sigma)
         reference_matrix = reference_adata.X.toarray() if hasattr(reference_adata.X, 'toarray') else reference_adata.X.copy()
         spatial_coords = reference_adata.obsm['spatial']
 
@@ -180,8 +168,6 @@ class SpatialSimulator:
         )
         simulated_adata.uns['simulation_method'] = 'Deterministic_Rank_Preservation'
         simulated_adata.uns['simulation_params'] = {
-            'sigma': 0 if sigma is None else sigma,
-            'follower_sigma_factor': follower_sigma_factor,
             'clip_overshoot_factor': clip_overshoot_factor
         }
         return simulated_adata
@@ -258,9 +244,8 @@ class SpatialSimulator:
         return smoother
     
     def _guided_assignment_core(self, reference_matrix, new_counts, spatial_smoother,
-                               gene_modules, leader_genes_indices, sigma, follower_sigma_factor, verbose=False):
+                               gene_modules, leader_genes_indices, verbose=False):
         """Compatibility wrapper for deterministic rank assignment."""
-        _validate_sigma_removed(sigma)
         n_spots, n_genes = reference_matrix.shape
         S_final = np.zeros_like(reference_matrix, dtype=np.float32)
         reference_ranks = np.argsort(reference_matrix, axis=0)
@@ -635,8 +620,6 @@ class SpatialSimulator:
         }
         self.fit_model(**fit_kwargs)
         simulated = self.simulate(
-            sigma=kwargs.get("sigma", 0),
-            follower_sigma_factor=kwargs.get("follower_sigma_factor", 0),
             num_simulation_cores=kwargs.get("num_simulation_cores", 12),
             verbose=kwargs.get("verbose", True),
             clip_overshoot_factor=kwargs.get("clip_overshoot_factor", 0.1),
@@ -646,13 +629,11 @@ class SpatialSimulator:
         return simulated
     
 
-def simulate_single_slice(adata: ad.AnnData, sigma: float = 0, follower_sigma_factor: float = 0, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, **kwargs) -> ad.AnnData:
+def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1) -> ad.AnnData:
     """
     Run deterministic single-slice simulation with optional marginal distribution alteration.
     
     Args:
-        sigma (float): Compatibility parameter. Only ``0`` or ``None`` is supported.
-        follower_sigma_factor (float): Legacy compatibility parameter, ignored.
         boundary_multiplier (float): Multiplier for maximum count boundary constraint (default 1.1 = 110% of reference max).
             - 1.0: Strict boundary at reference maximum
             - 1.1: Allow 10% overshoot (default)
@@ -669,7 +650,6 @@ def simulate_single_slice(adata: ad.AnnData, sigma: float = 0, follower_sigma_fa
                 )
         Other parameters: See individual parameter documentation in fit_model() and simulate() methods.
     """
-    _validate_sigma_removed(sigma)
     if verbose: print("Starting comprehensive single slice simulation...")
     adata = adata.copy()
     safe_calculate_qc_metrics(adata, verbose=verbose)
@@ -695,7 +675,6 @@ def simulate_single_slice(adata: ad.AnnData, sigma: float = 0, follower_sigma_fa
             verbose=verbose, 
             clip_overshoot_factor=clip_overshoot_factor, 
             **heuristic_kwargs, # Pass all heuristic controls
-            **kwargs
         )
 
 
@@ -715,8 +694,6 @@ def simulate_single_slice(adata: ad.AnnData, sigma: float = 0, follower_sigma_fa
             **heuristic_kwargs # Pass all heuristic controls
         )
         simulated_adata = simulator.simulate(
-            sigma=sigma,
-            follower_sigma_factor=follower_sigma_factor,
             num_simulation_cores=num_simulation_cores, 
             verbose=verbose, 
             clip_overshoot_factor=clip_overshoot_factor,

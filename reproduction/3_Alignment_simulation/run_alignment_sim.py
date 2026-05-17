@@ -51,7 +51,6 @@ if __name__ == "__main__":
             transformation_type='rotation',
             rotation_angle=angle,
             data_type='sequencing',
-            sigma=0,
             warp_strength=0
         )
 

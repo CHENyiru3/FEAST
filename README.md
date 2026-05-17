@@ -62,7 +62,6 @@ adata = sc.read_h5ad("your_spatial_data.h5ad")
 # Simple simulation with default parameters
 simulated_adata = simulator.simulate_single_slice(
     adata=adata,
-    sigma=0,  # deterministic rank-preserving compatibility path
     verbose=True
 )
 
@@ -72,8 +71,7 @@ from FEAST.modeling.marginal_alteration import AlterationConfig
 alteration_config = AlterationConfig.mean_only(fold_change=2.0)
 altered_adata = simulator.simulate_single_slice(
     adata=adata,
-    alteration_config=alteration_config,
-    sigma=0
+    alteration_config=alteration_config
 )
 ```
 
@@ -86,8 +84,7 @@ from FEAST import alignment
 original, rotated = alignment.simulate_alignment_rotation(
     adata=adata,
     rotation_angle=30.0,  # degrees
-    data_type='imaging',  # or 'sequencing'
-    sigma=0  # Perfect pattern preservation
+    data_type='imaging'  # or 'sequencing'
 )
 ```
 
