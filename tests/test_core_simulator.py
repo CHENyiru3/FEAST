@@ -1,9 +1,18 @@
+import inspect
+
 import numpy as np
 import pandas as pd
 import anndata as ad
 import pytest
 
 from FEAST.FEAST_core.simulator import SpatialSimulator, simulate_single_slice
+from FEAST.FEAST_core.APIs import FEAST
+from FEAST.alignment import simulate_alignment_rotation, simulate_alignment_warp
+from FEAST.deconvolution import (
+    DeconvolutionSimulator,
+    create_deconvolution_benchmark_suite,
+    simulate_deconvolution_from_single_cells,
+)
 
 
 def _adata():
@@ -20,17 +29,33 @@ def _model_params():
     }
 
 
-def test_nonzero_sigma_rejected():
+def test_sigma_parameters_removed_from_public_core_api():
+    public_callables = [
+        SpatialSimulator.simulate,
+        simulate_single_slice,
+        FEAST.simulate_single_slice,
+        FEAST.simulate_alignment,
+        simulate_alignment_rotation,
+        simulate_alignment_warp,
+        DeconvolutionSimulator.simulate_deconvolution_data,
+        DeconvolutionSimulator.create_deconvolution_benchmark_suite,
+        simulate_deconvolution_from_single_cells,
+        create_deconvolution_benchmark_suite,
+    ]
+    for fn in public_callables:
+        assert "sigma" not in inspect.signature(fn).parameters
+        assert "follower_sigma_factor" not in inspect.signature(fn).parameters
+
     simulator = SpatialSimulator(_adata(), model_params=_model_params())
-    with pytest.raises(ValueError, match="G-SRBA/G-SBGA"):
+    with pytest.raises(TypeError):
         simulator.simulate(sigma=0.5, verbose=False)
-    with pytest.raises(ValueError, match="G-SRBA/G-SBGA"):
+    with pytest.raises(TypeError):
         simulate_single_slice(_adata(), sigma=1.0, verbose=False)
 
 
-def test_zero_sigma_deterministic_path_with_model_params():
+def test_deterministic_path_with_model_params():
     simulator = SpatialSimulator(_adata(), model_params=_model_params())
-    simulated = simulator.simulate(sigma=0, verbose=False)
+    simulated = simulator.simulate(verbose=False)
     assert simulated.shape == (3, 2)
     assert "spatial" in simulated.obsm
     assert simulated.uns["simulation_method"] == "Deterministic_Rank_Preservation"
