@@ -13,7 +13,7 @@ from sklearn.neighbors import NearestNeighbors
 from ..FEAST_core.count_decoding import decode_counts_from_quantiles, resolve_decode_method
 from ._metadata import records_by_label_to_h5ad_uns
 from ._transport import log_sinkhorn
-from .core import SliceBlueprint, load_blueprint
+from .core import SliceBlueprint, active_mask_metadata, assign_generated_coordinates, load_blueprint
 from .pattern import diffuse_quantile_map
 
 
@@ -23,6 +23,7 @@ class ConditionalReferenceConfig:
     min_gene_mean: float = 0.1
     max_gene_zero_prop: float = 0.98
     boundary_neighbors: int = 6
+    coordinate_scale: Optional[Sequence[float]] = None
 
 
 @dataclass
@@ -43,6 +44,7 @@ class VirtualSliceGenerationConfig:
     diffusion_level: float = 0.0
     boundary_softness: float = 0.0
     assignment_randomness: float = 0.0
+    coordinate_scale: Optional[Sequence[float]] = None
     verbose: bool = False
 
 
@@ -68,6 +70,7 @@ class ConditionalReferenceModel:
     gene_names: List[str]
     label_key: str
     references: List[ReferenceSliceData]
+    coordinate_dim: int
     fit_config: ConditionalReferenceConfig = field(default_factory=ConditionalReferenceConfig)
     reference_metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -89,6 +92,7 @@ def fit_virtual_slice_reference(
 
     references: List[ReferenceSliceData] = []
     label_set: set[str] = set()
+    coordinate_dim: Optional[int] = None
     for idx, adata in enumerate(slices):
         if label_key not in adata.obs:
             raise KeyError(f"Reference slice {idx} is missing label_key '{label_key}'.")
@@ -97,18 +101,24 @@ def fit_virtual_slice_reference(
             subset.layers["counts"] = _to_dense_matrix(subset.X).astype(np.float32, copy=False)
         labels = _label_series(subset, label_key)
         coords = _coordinates(subset)
-        boundary_scores = _boundary_scores(coords, labels.to_numpy(), fit_cfg.boundary_neighbors)
+        if coordinate_dim is None:
+            coordinate_dim = int(coords.shape[1])
+        elif int(coords.shape[1]) != coordinate_dim:
+            raise ValueError("Reference slices must use the same coordinate dimensionality.")
+        scaled_coords = _apply_coordinate_scale(coords, fit_cfg.coordinate_scale)
+        boundary_scores = _boundary_scores(scaled_coords, labels.to_numpy(), fit_cfg.boundary_neighbors)
 
         label_map: Dict[str, ReferenceLabelData] = {}
         for label in sorted(labels.unique()):
             mask = labels.to_numpy() == label
             label_coords = coords[mask]
+            label_scaled_coords = scaled_coords[mask]
             label_counts = _layer_counts_matrix(subset, mask)
             label_quantiles = _calculate_quantiles(label_counts)
             label_map[label] = ReferenceLabelData(
                 label=label,
                 coordinates=label_coords,
-                normalized_coordinates=_normalize_label_coordinates(label_coords),
+                normalized_coordinates=_normalize_label_coordinates(label_scaled_coords),
                 boundary_scores=boundary_scores[mask],
                 quantiles=label_quantiles,
                 stats=_stats_dataframe(label_counts, filtered_genes),
@@ -127,11 +137,14 @@ def fit_virtual_slice_reference(
         gene_names=list(filtered_genes),
         label_key=label_key,
         references=references,
+        coordinate_dim=int(coordinate_dim or 2),
         fit_config=fit_cfg,
         reference_metadata={
             "n_reference_slices": len(references),
             "n_reference_genes": len(filtered_genes),
             "labels": sorted(label_set),
+            "coordinate_dim": int(coordinate_dim or 2),
+            "coordinate_scale": None if fit_cfg.coordinate_scale is None else [float(v) for v in fit_cfg.coordinate_scale],
         },
     )
 
@@ -142,11 +155,21 @@ def generate_virtual_slice(
     parameter_cloud: Optional[Union[pd.DataFrame, Mapping[str, Any]]] = None,
     config: Optional[VirtualSliceGenerationConfig] = None,
     random_seed: int = 0,
+    reference_weights: Optional[Mapping[str, float]] = None,
 ) -> ad.AnnData:
     gen_cfg = config or VirtualSliceGenerationConfig()
-    blueprint = _load_target_blueprint(target_blueprint, label_key=model.label_key)
+    original_blueprint = _load_target_blueprint(target_blueprint, label_key=model.label_key)
+    mask_metadata = active_mask_metadata(original_blueprint)
+    blueprint = original_blueprint.active_subset()
     target_labels = _blueprint_labels(blueprint)
-    target_coords = np.asarray(blueprint.coordinates, dtype=float)
+    target_coords_raw = np.asarray(blueprint.coordinates, dtype=float)
+    if target_coords_raw.shape[1] != int(model.coordinate_dim):
+        raise ValueError(
+            "Target blueprint coordinate dimensionality does not match the reference model "
+            f"({target_coords_raw.shape[1]} != {model.coordinate_dim})."
+        )
+    coordinate_scale = gen_cfg.coordinate_scale if gen_cfg.coordinate_scale is not None else model.fit_config.coordinate_scale
+    target_coords = _apply_coordinate_scale(target_coords_raw, coordinate_scale)
     target_boundary_scores = _boundary_scores(
         target_coords,
         target_labels,
@@ -177,13 +200,16 @@ def generate_virtual_slice(
             if not eligible_refs:
                 raise ValueError(f"No reference slice contains target label '{label}'.")
 
-            ref_weights = _reference_weights_for_label(
-                eligible_refs,
-                label,
-                target_coords_norm,
-                target_boundary_label,
-                gen_cfg.reference_weight_eta,
-            )
+            if reference_weights is None:
+                ref_weights = _reference_weights_for_label(
+                    eligible_refs,
+                    label,
+                    target_coords_norm,
+                    target_boundary_label,
+                    gen_cfg.reference_weight_eta,
+                )
+            else:
+                ref_weights = _fixed_reference_weights_for_label(eligible_refs, reference_weights)
             label_weights_out[label] = ref_weights
 
             transported_parts = []
@@ -279,7 +305,11 @@ def generate_virtual_slice(
         label=None,
         gene_names=model.gene_names,
         eligible_refs=model.references,
-        reference_weights={ref.reference_name: 1.0 / len(model.references) for ref in model.references},
+        reference_weights=(
+            _normalize_reference_weight_mapping(model.references, reference_weights)
+            if reference_weights is not None
+            else {ref.reference_name: 1.0 / len(model.references) for ref in model.references}
+        ),
     )
     var = pd.DataFrame(index=model.gene_names)
     var["target_mean"] = global_cloud["mean"].to_numpy(dtype=np.float64)
@@ -289,7 +319,6 @@ def generate_virtual_slice(
     result = ad.AnnData(X=counts, obs=obs, var=var)
     result.layers["counts"] = counts.astype(np.int32, copy=False)
     result.layers["transported_quantiles"] = quantiles.astype(np.float32, copy=False)
-    result.obsm["spatial"] = target_coords.copy()
     result.uns["de_novo"] = {
         "conditional_generation": True,
         "label_key": model.label_key,
@@ -302,7 +331,9 @@ def generate_virtual_slice(
         "diffusion_level": float(gen_cfg.diffusion_level),
         "boundary_softness": float(gen_cfg.boundary_softness),
         "assignment_randomness": float(gen_cfg.assignment_randomness),
+        "mask": mask_metadata,
     }
+    assign_generated_coordinates(result, target_coords_raw)
     result.uns["target_blueprint"] = blueprint.to_dict()
     return result
 
@@ -318,8 +349,8 @@ def _normalize_reference_slices(reference_slices: Union[ad.AnnData, Sequence[ad.
     for adata in slices:
         if not isinstance(adata, ad.AnnData):
             raise TypeError("reference_slices must contain AnnData objects.")
-        if "spatial" not in adata.obsm:
-            raise ValueError("Each reference slice must contain obsm['spatial'].")
+        if "spatial_3d" not in adata.obsm and "spatial" not in adata.obsm:
+            raise ValueError("Each reference slice must contain obsm['spatial_3d'] or obsm['spatial'].")
         normalized.append(adata)
     return normalized
 
@@ -362,12 +393,27 @@ def _label_series(adata: ad.AnnData, label_key: str) -> pd.Series:
 
 
 def _coordinates(adata: ad.AnnData) -> np.ndarray:
-    if "spatial" not in adata.obsm:
-        raise ValueError("AnnData must contain obsm['spatial'].")
-    coords = np.asarray(adata.obsm["spatial"], dtype=float)
+    if "spatial_3d" in adata.obsm:
+        coords = np.asarray(adata.obsm["spatial_3d"], dtype=float)
+    elif "spatial" in adata.obsm:
+        coords = np.asarray(adata.obsm["spatial"], dtype=float)
+    else:
+        raise ValueError("AnnData must contain obsm['spatial_3d'] or obsm['spatial'].")
     if coords.ndim != 2 or coords.shape[1] < 2:
-        raise ValueError("obsm['spatial'] must be a 2D array with at least two columns.")
-    return coords[:, :2]
+        raise ValueError("spatial coordinates must be a 2D array with at least two columns.")
+    if coords.shape[1] > 3:
+        raise ValueError("spatial coordinates supports only 2D or 3D coordinates in v1.")
+    return coords.copy()
+
+
+def _apply_coordinate_scale(coords: np.ndarray, coordinate_scale: Optional[Sequence[float]]) -> np.ndarray:
+    arr = np.asarray(coords, dtype=float)
+    if coordinate_scale is None:
+        return arr.copy()
+    scale = np.asarray(coordinate_scale, dtype=float).reshape(-1)
+    if scale.shape[0] != arr.shape[1]:
+        raise ValueError(f"coordinate_scale must contain {arr.shape[1]} values.")
+    return arr * scale[None, :]
 
 
 def _to_dense_matrix(matrix) -> np.ndarray:
@@ -420,7 +466,8 @@ def _calculate_quantiles(matrix: np.ndarray) -> np.ndarray:
 def _normalize_label_coordinates(coords: np.ndarray) -> np.ndarray:
     coords = np.asarray(coords, dtype=float)
     if coords.shape[0] == 0:
-        return coords.reshape(0, 2)
+        coordinate_dim = coords.shape[1] if coords.ndim == 2 else 0
+        return coords.reshape(0, coordinate_dim)
     center = coords.mean(axis=0, keepdims=True)
     scale = coords.std(axis=0, keepdims=True)
     scale[scale <= 1e-6] = 1.0
@@ -521,6 +568,34 @@ def _reference_weights_for_label(
     weights = np.exp(-float(eta) * shifted)
     weights = weights / max(float(weights.sum()), 1e-8)
     return {name: float(weight) for name, weight in zip(names, weights)}
+
+
+def _fixed_reference_weights_for_label(
+    references: Sequence[ReferenceSliceData],
+    reference_weights: Mapping[str, float],
+) -> Dict[str, float]:
+    weights = {
+        ref.reference_name: float(reference_weights.get(ref.reference_name, 0.0))
+        for ref in references
+    }
+    total = float(sum(max(weight, 0.0) for weight in weights.values()))
+    if total <= 0.0:
+        raise ValueError("reference_weights must assign positive mass to at least one eligible reference.")
+    return {name: max(weight, 0.0) / total for name, weight in weights.items()}
+
+
+def _normalize_reference_weight_mapping(
+    references: Sequence[ReferenceSliceData],
+    reference_weights: Mapping[str, float],
+) -> Dict[str, float]:
+    weights = {
+        ref.reference_name: float(reference_weights.get(ref.reference_name, 0.0))
+        for ref in references
+    }
+    total = float(sum(max(weight, 0.0) for weight in weights.values()))
+    if total <= 0.0:
+        return {ref.reference_name: 1.0 / len(references) for ref in references}
+    return {name: max(weight, 0.0) / total for name, weight in weights.items()}
 
 
 def _solve_label_transport(

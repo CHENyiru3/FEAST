@@ -23,6 +23,7 @@ from .pattern import (
     plot_gene_pattern as _plot_pattern_impl,
     plot_pattern_panel,
 )
+from .stack import simulate_stack as _simulate_stack_impl
 
 
 def simulate_from_design(*args, **kwargs):
@@ -35,6 +36,10 @@ def fit_reference(*args, **kwargs):
 
 def simulate_from_reference(*args, **kwargs):
     return _simulate_from_reference_impl(*args, **kwargs)
+
+
+def simulate_stack(*args, **kwargs):
+    return _simulate_stack_impl(*args, **kwargs)
 
 
 def evaluate_motif(*args, **kwargs):
@@ -61,6 +66,7 @@ _PUBLIC_NAMES = [
     "evaluate_motif",
     "fit_reference",
     "simulate_from_reference",
+    "simulate_stack",
     "simulate_from_design",
     "load_blueprint",
     "plot_pattern",
@@ -79,6 +85,7 @@ for _name in [
     "simulate_from_design",
     "fit_reference",
     "simulate_from_reference",
+    "simulate_stack",
     "evaluate_motif",
     "compose_pattern",
     "plot_pattern",

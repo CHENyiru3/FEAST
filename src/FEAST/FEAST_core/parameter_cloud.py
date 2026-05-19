@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import warnings
+from typing import Optional
 
 # --- Imports for parallelization and distribution distance ---
 from joblib import Parallel, delayed
@@ -22,8 +23,97 @@ from ..modeling.StudentT_mixture_model import StudentTMixtureMarginalModeler
 from ..modeling.Beta_mixture_model import BetaMixtureMarginalModeler
 from ..modeling.marginal_alteration import alter_marginal_model, AlterationConfig
 
+STAT_COLUMNS = ['mean', 'variance', 'zero_prop']
+SIMULATION_MODES = ('generative', 'empirical')
+
 def to_uniform(series):
     return rankdata(series, method='ordinal') / (len(series) + 1)
+
+
+def resolve_simulation_mode(simulation_mode: str = 'generative') -> str:
+    """Normalize and validate the public FEAST simulation mode."""
+    mode = str(simulation_mode).lower().strip()
+    compatibility_aliases = {
+        'dependency': 'generative',
+        'copula': 'generative',
+        'vine': 'generative',
+        'direct': 'empirical',
+        'real': 'empirical',
+        'real_stats': 'empirical',
+    }
+    mode = compatibility_aliases.get(mode, mode)
+    if mode not in SIMULATION_MODES:
+        raise ValueError("simulation_mode must be 'generative' or 'empirical'.")
+    return mode
+
+
+def normalize_alteration_config(alteration_config=None) -> Optional[AlterationConfig]:
+    """Return an AlterationConfig instance or None."""
+    if alteration_config is None:
+        return None
+    if isinstance(alteration_config, AlterationConfig):
+        return alteration_config
+    if isinstance(alteration_config, dict):
+        return AlterationConfig(**alteration_config)
+    raise TypeError("alteration_config must be an AlterationConfig, dict, or None.")
+
+
+def alteration_config_to_dict(alteration_config=None) -> Optional[dict]:
+    config = normalize_alteration_config(alteration_config)
+    return None if config is None else config.to_dict()
+
+
+def apply_alteration_to_stats(stats_df: pd.DataFrame, alteration_config=None) -> pd.DataFrame:
+    """Apply deterministic fold-change transforms to gene summary statistics."""
+    config = normalize_alteration_config(alteration_config)
+    target = stats_df.copy()
+    if config is None:
+        return target
+
+    if config.apply_to_mean:
+        target['mean'] = target['mean'] * float(config.mean_fold_change)
+    if config.apply_to_variance:
+        target['variance'] = target['variance'] * float(config.variance_fold_change)
+    if config.apply_to_zero_prop:
+        target['zero_prop'] = target['zero_prop'] * float(config.sparsity_fold_change)
+    return target
+
+
+def project_stats_to_feasible_domain(stats_df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Project summary statistics onto basic nonnegative count-domain bounds."""
+    requested = stats_df[STAT_COLUMNS].copy()
+    projected = requested.copy()
+    projected['mean'] = projected['mean'].clip(lower=0.0)
+    projected['variance'] = projected['variance'].clip(lower=0.0)
+    projected['zero_prop'] = projected['zero_prop'].clip(lower=0.0, upper=0.99)
+
+    changed = (np.abs(projected - requested) > 1e-12).any(axis=1)
+    zero_clipped = np.abs(projected['zero_prop'] - requested['zero_prop']) > 1e-12
+    return projected, {
+        'infeasible_gene_count': int(changed.sum()),
+        'zero_prop_clipped_gene_count': int(zero_clipped.sum()),
+        'projection_applied': bool(changed.any()),
+    }
+
+
+def calculate_fold_change(reference_stats: pd.DataFrame, target_stats: pd.DataFrame) -> dict:
+    """Aggregate fold change for gene summary statistics."""
+    if 'gene_id' in target_stats.columns:
+        target = target_stats.set_index('gene_id')
+    else:
+        target = target_stats
+    target = target.loc[reference_stats.index, STAT_COLUMNS]
+    changes = {}
+    for column in STAT_COLUMNS:
+        denom = float(np.mean(reference_stats[column]))
+        numer = float(np.mean(target[column]))
+        changes[column] = float(numer / denom) if abs(denom) > 1e-12 else None
+    return changes
+
+
+def pseudo_observations(stats_df: pd.DataFrame) -> pd.DataFrame:
+    """Return empirical copula pseudo-observations for gene statistics."""
+    return stats_df[STAT_COLUMNS].apply(to_uniform)
 
 class DependencyModeler:
     @staticmethod
@@ -50,6 +140,13 @@ def _run_single_heuristic_attempt(simulator, synthetic_pool, assignment_weights,
     error = simulator.evaluate_parameter_fidelity(assigned_params, weights=assignment_weights)
     return error, assigned_params
 
+
+def _assignment_weight_vector(weights=None) -> np.ndarray:
+    defaults = {'mean': 1.0, 'variance': 1.0, 'zero_prop': 1.0}
+    if weights:
+        defaults.update(weights)
+    return np.array([defaults['mean'], defaults['variance'], defaults['zero_prop']], dtype=float)
+
 class GeneParameterSimulator:
     def __init__(self):
         self.param_models = {
@@ -60,7 +157,13 @@ class GeneParameterSimulator:
         print("✓ Using optimal models: Student's T for mean, Student's T for variance, Beta for zero_prop.")
         
         self.fitted = False
-        self.copula_model, self.original_stats, self.dependency_modeler, self.n_obs = None, None, DependencyModeler(), None
+        self.copula_model, self.original_stats, self.target_stats, self.dependency_modeler, self.n_obs = (
+            None,
+            None,
+            None,
+            DependencyModeler(),
+            None,
+        )
 
     def fit_statistics_only(self, adata):
         print("\n--- [FITTING STATS ONLY] Calculating original gene statistics ---")
@@ -71,6 +174,7 @@ class GeneParameterSimulator:
             'variance': np.var(X, axis=0), 
             'zero_prop': 1 - (np.count_nonzero(X, axis=0) / self.n_obs)
         }, index=adata.var_names).clip(lower=1e-10)
+        self.target_stats = self.original_stats.copy()
         print("✓ Statistics calculated.")
         return self
 
@@ -92,31 +196,41 @@ class GeneParameterSimulator:
         print("\n✓ Simulator has been successfully fitted to the data.")
         return self
 
-    def simulate(self, n_genes, overgeneration_factor=1.1, verbose=True):
+    def _assignment_stats(self):
+        if self.target_stats is not None:
+            return self.target_stats
+        return self.original_stats
+
+    def simulate(self, n_genes, overgeneration_factor=1.1, verbose=True, random_seed=None, return_uniform=False):
         if not self.fitted: raise RuntimeError("Simulator must be fitted first.")
-        n_to_generate = int(n_genes * overgeneration_factor)
+        n_to_generate = max(int(n_genes), int(n_genes * overgeneration_factor))
         if verbose: print(f"\n--- [SIMULATING] Generating {n_to_generate} synthetic profiles...")
         
-        uniform_samples = self.copula_model.simulate(n=n_to_generate, seeds=[np.random.randint(1e6)])
+        seed = int(random_seed) if random_seed is not None else int(np.random.randint(1e6))
+        uniform_samples = self.copula_model.simulate(n=n_to_generate, seeds=[seed])
         final_params = pd.DataFrame({
             param: modeler.ppf(uniform_samples[:, i]) for i, (param, modeler) in enumerate(self.param_models.items())
         })
         
-        if verbose: print("  > Enforcing minimum observed parameter boundaries...")
+        reference_stats = self._assignment_stats()
+        if verbose: print("  > Enforcing minimum target parameter boundaries...")
         for param in ['mean', 'variance', 'zero_prop']:
-            final_params[param] = final_params[param].clip(lower=self.original_stats[param].min())
+            final_params[param] = final_params[param].clip(lower=reference_stats[param].min())
         final_params['zero_prop'] = final_params['zero_prop'].clip(upper=1.0)
         
         if verbose: print("✓ Simulation complete.")
+        if return_uniform:
+            return final_params, uniform_samples
         return final_params
 
     def assign_to_genes(self, synthetic_df, weights={'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0}, random_seed=42, verbose=True):
         if verbose: print(f"\n--- [ASSIGNING] Assigning synthetic profiles (seed: {random_seed})...")
-        if len(synthetic_df) < len(self.original_stats): raise ValueError("Fewer synthetic profiles than real genes. Increase overgeneration_factor.")
+        assignment_stats = self._assignment_stats()
+        if len(synthetic_df) < len(assignment_stats): raise ValueError("Fewer synthetic profiles than real genes. Increase overgeneration_factor.")
         
-        synthetic_subset = synthetic_df.sample(n=len(self.original_stats), random_state=random_seed).reset_index(drop=True)
+        synthetic_subset = synthetic_df.sample(n=len(assignment_stats), random_state=random_seed).reset_index(drop=True)
         scaler = StandardScaler()
-        orig_scaled = scaler.fit_transform(np.log10(self.original_stats.clip(lower=1e-10)))
+        orig_scaled = scaler.fit_transform(np.log10(assignment_stats.clip(lower=1e-10)))
         synth_scaled = scaler.transform(np.log10(synthetic_subset.clip(lower=1e-10)))
         
         weight_vector = np.array([weights['mean'], weights['variance'], weights['zero_prop']])
@@ -124,17 +238,126 @@ class GeneParameterSimulator:
         
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         assigned_df = synthetic_subset.iloc[col_ind].reset_index(drop=True)
-        assigned_df['gene_id'] = self.original_stats.index[row_ind]
+        assigned_df['gene_id'] = assignment_stats.index[row_ind]
         
         if verbose: print("✓ Assignment complete.")
         return assigned_df[['gene_id', 'mean', 'variance', 'zero_prop']]
 
+    def assign_to_genes_copula_rank(
+        self,
+        synthetic_df,
+        synthetic_uniform,
+        weights=None,
+        random_seed=None,
+        verbose=True,
+    ):
+        """Assign sampled profiles to genes by optimal transport in copula-rank space."""
+        if verbose:
+            print("\n--- [ASSIGNING] Assigning synthetic profiles with Copula-rank OT...")
+        if self.original_stats is None:
+            raise RuntimeError("Original statistics are not available.")
+        if len(synthetic_df) < len(self.original_stats):
+            raise ValueError("Fewer synthetic profiles than real genes. Increase overgeneration_factor.")
+
+        rng = np.random.default_rng(None if random_seed is None else int(random_seed))
+        n_genes = len(self.original_stats)
+        subset_idx = rng.choice(len(synthetic_df), size=n_genes, replace=False)
+        synthetic_subset = synthetic_df.iloc[subset_idx].reset_index(drop=True)
+        sampled_u = np.asarray(synthetic_uniform, dtype=float)[subset_idx, :]
+
+        original_u = pseudo_observations(self.original_stats).to_numpy(dtype=float)
+        weight_vector = _assignment_weight_vector(weights)
+        cost_matrix = cdist(original_u * weight_vector, sampled_u * weight_vector, 'euclidean')
+
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        assigned_df = synthetic_subset.iloc[col_ind].reset_index(drop=True)
+        assigned_df['gene_id'] = self.original_stats.index[row_ind]
+
+        selected_costs = cost_matrix[row_ind, col_ind]
+        diagnostics = {
+            'assignment_method': 'copula_rank_ot',
+            'mean_cost': float(np.mean(selected_costs)) if selected_costs.size else 0.0,
+            'max_cost': float(np.max(selected_costs)) if selected_costs.size else 0.0,
+            'total_cost': float(np.sum(selected_costs)),
+            'n_profiles': int(n_genes),
+            'weights': {
+                'mean': float(weight_vector[0]),
+                'variance': float(weight_vector[1]),
+                'zero_prop': float(weight_vector[2]),
+            },
+        }
+        if verbose:
+            print("✓ Copula-rank OT assignment complete.")
+        return assigned_df[['gene_id', 'mean', 'variance', 'zero_prop']], diagnostics
+
+    def build_gene_parameter_table(
+        self,
+        alteration_config=None,
+        simulation_mode='generative',
+        assignment_weights=None,
+        random_seed=None,
+        overgeneration_factor=1.1,
+        verbose=True,
+    ):
+        """Build the gene-indexed target parameter table for an integrated simulation."""
+        mode = resolve_simulation_mode(simulation_mode)
+        config = normalize_alteration_config(alteration_config)
+        if self.original_stats is None:
+            raise RuntimeError("Simulator statistics are not available.")
+
+        if mode == 'empirical':
+            requested = apply_alteration_to_stats(self.original_stats, config)
+            projected, feasibility = project_stats_to_feasible_domain(requested)
+            table = projected.reset_index().rename(columns={'index': 'gene_id'})
+            diagnostics = {
+                'simulation_mode': 'empirical',
+                'gene_parameter_engine': 'empirical',
+                'assignment_method': 'identity',
+                'requested_config': alteration_config_to_dict(config),
+                'target_fold_change': alteration_config_to_dict(config),
+                'target_stage_achieved_change': calculate_fold_change(self.original_stats, table),
+                'copula_rank_diagnostics': {'assignment_method': 'identity'},
+                'moment_feasibility': feasibility,
+            }
+            return table[['gene_id', 'mean', 'variance', 'zero_prop']], diagnostics
+
+        if not self.fitted:
+            raise RuntimeError("Generative simulation requires fitted marginal and copula models.")
+        sampled_params, sampled_u = self.simulate(
+            n_genes=len(self.original_stats),
+            overgeneration_factor=overgeneration_factor,
+            verbose=verbose,
+            random_seed=random_seed,
+            return_uniform=True,
+        )
+        requested = apply_alteration_to_stats(sampled_params, config)
+        projected, feasibility = project_stats_to_feasible_domain(requested)
+        assigned, assignment_diag = self.assign_to_genes_copula_rank(
+            projected,
+            sampled_u,
+            weights=assignment_weights,
+            random_seed=random_seed,
+            verbose=verbose,
+        )
+        diagnostics = {
+            'simulation_mode': 'generative',
+            'gene_parameter_engine': 'generative',
+            'assignment_method': 'copula_rank_ot',
+            'requested_config': alteration_config_to_dict(config),
+            'target_fold_change': alteration_config_to_dict(config),
+            'target_stage_achieved_change': calculate_fold_change(self.original_stats, assigned),
+            'copula_rank_diagnostics': assignment_diag,
+            'moment_feasibility': feasibility,
+        }
+        return assigned[['gene_id', 'mean', 'variance', 'zero_prop']], diagnostics
+
     def evaluate_parameter_fidelity(self, assigned_synthetic_params: pd.DataFrame, weights={'mean': 1.0, 'variance': 1.0, 'zero_prop': 1.0}):
         if self.original_stats is None: raise RuntimeError("Original statistics are not available.")
         
-        assigned_reordered = assigned_synthetic_params.set_index('gene_id').loc[self.original_stats.index]
+        assignment_stats = self._assignment_stats()
+        assigned_reordered = assigned_synthetic_params.set_index('gene_id').loc[assignment_stats.index]
         scaler = StandardScaler()
-        orig_scaled = scaler.fit_transform(np.log10(self.original_stats.clip(lower=1e-10)))
+        orig_scaled = scaler.fit_transform(np.log10(assignment_stats.clip(lower=1e-10)))
         synth_scaled = scaler.transform(np.log10(assigned_reordered.clip(lower=1e-10)))
         
         weight_vector = np.array([weights['mean'], weights['variance'], weights['zero_prop']])
@@ -142,9 +365,10 @@ class GeneParameterSimulator:
         return np.mean(weighted_squared_errors)
     
     def _calculate_distribution_distance(self, synthetic_subset):
-        dist_mean = wasserstein_distance(self.original_stats['mean'], synthetic_subset['mean'])
-        dist_var = wasserstein_distance(np.log10(self.original_stats['variance']), np.log10(synthetic_subset['variance']))
-        dist_zero = wasserstein_distance(self.original_stats['zero_prop'], synthetic_subset['zero_prop'])
+        assignment_stats = self._assignment_stats()
+        dist_mean = wasserstein_distance(assignment_stats['mean'], synthetic_subset['mean'])
+        dist_var = wasserstein_distance(np.log10(assignment_stats['variance']), np.log10(synthetic_subset['variance']))
+        dist_zero = wasserstein_distance(assignment_stats['zero_prop'], synthetic_subset['zero_prop'])
         return dist_mean + dist_var + dist_zero
 
     def run_heuristic_search(self, n_genes, min_accepted_error, screening_pool_size=100, top_n_to_fully_evaluate=5, overgeneration_factor=1.1, assignment_weights=None, n_jobs=-1):
@@ -228,22 +452,31 @@ class GeneParameterSimulator:
         
         if verbose:
             print(f"\n--- [ALTERING MARGINALS] Applying distribution modifications ---")
-            print(f"  Mean fold change: {alteration_config.mean_fold_change}x")
-            print(f"  Variance fold change: {alteration_config.variance_fold_change}x")
+            print(f"  Mean level fold change: {alteration_config.mean_fold_change}x")
+            print(f"  Variance level fold change: {alteration_config.variance_fold_change}x")
+            print(f"  Zero proportion fold change: {alteration_config.sparsity_fold_change}x")
             print(f"  Apply to mean: {alteration_config.apply_to_mean}")
             print(f"  Apply to variance: {alteration_config.apply_to_variance}")
             print(f"  Apply to zero_prop: {alteration_config.apply_to_zero_prop}")
         
+        if self.target_stats is None:
+            self.target_stats = self.original_stats.copy()
+
         # Apply alterations to selected marginal distributions
         alterations_applied = []
         
         if alteration_config.apply_to_mean:
             if verbose:
                 print("\n  > Altering MEAN distribution...")
+            self.target_stats['mean'] = np.clip(
+                self.target_stats['mean'] * alteration_config.mean_fold_change,
+                1e-10,
+                None,
+            )
             self.param_models['mean'] = alter_marginal_model(
                 self.param_models['mean'],
                 mean_fold_change=alteration_config.mean_fold_change,
-                variance_fold_change=alteration_config.variance_fold_change,
+                variance_fold_change=1.0,
                 dispersion_strength=alteration_config.dispersion_strength,
                 preserve_original=False,  # Modify in place
                 verbose=verbose
@@ -253,10 +486,15 @@ class GeneParameterSimulator:
         if alteration_config.apply_to_variance:
             if verbose:
                 print("\n  > Altering VARIANCE distribution...")
+            self.target_stats['variance'] = np.clip(
+                self.target_stats['variance'] * alteration_config.variance_fold_change,
+                1e-10,
+                None,
+            )
             self.param_models['variance'] = alter_marginal_model(
                 self.param_models['variance'],
-                mean_fold_change=alteration_config.mean_fold_change,
-                variance_fold_change=alteration_config.variance_fold_change,
+                mean_fold_change=alteration_config.variance_fold_change,
+                variance_fold_change=1.0,
                 dispersion_strength=alteration_config.dispersion_strength,
                 preserve_original=False,  # Modify in place
                 verbose=verbose
@@ -266,10 +504,16 @@ class GeneParameterSimulator:
         if alteration_config.apply_to_zero_prop:
             if verbose:
                 print("\n  > Altering ZERO PROPORTION distribution...")
+            self.target_stats['zero_prop'] = np.clip(
+                self.target_stats['zero_prop'] * alteration_config.sparsity_fold_change,
+                1e-10,
+                0.99,
+            )
             self.param_models['zero_prop'] = alter_marginal_model(
                 self.param_models['zero_prop'],
-                mean_fold_change=alteration_config.mean_fold_change,
-                variance_fold_change=alteration_config.variance_fold_change,
+                mean_fold_change=1.0,
+                variance_fold_change=1.0,
+                sparsity_fold_change=alteration_config.sparsity_fold_change,
                 dispersion_strength=alteration_config.dispersion_strength,
                 preserve_original=False,  # Modify in place
                 verbose=verbose
@@ -434,6 +678,9 @@ def convert_params_for_new_simulator(stats_df: pd.DataFrame):
     parameters for specific count models (ZINB, etc.) using the improved
     log-scale moment inference method.
     """
+    if 'gene_id' in stats_df.columns:
+        stats_df = stats_df.set_index('gene_id')
+    stats_df = stats_df[STAT_COLUMNS].copy()
     print(f"\n--- [CONVERTING] Converting {len(stats_df)} parameter sets via log-scale moment-matching ---")
     
     output_dict = {'genes': {}, 'model_selected': [], 'marginal_param1': []}

@@ -54,6 +54,7 @@ def test_de_novo_public_api_imports():
         "evaluate_motif",
         "fit_reference",
         "simulate_from_reference",
+        "simulate_stack",
         "simulate_from_design",
         "load_blueprint",
         "plot_pattern",
@@ -73,6 +74,7 @@ def test_de_novo_public_api_imports():
         evaluate_motif,
         fit_reference,
         simulate_from_reference,
+        simulate_stack,
         simulate_from_design,
         load_blueprint,
         plot_blueprint,
@@ -91,6 +93,7 @@ def test_de_novo_public_api_imports():
     assert evaluate_motif is not None
     assert fit_reference is not None
     assert simulate_from_reference is not None
+    assert simulate_stack is not None
     assert simulate_from_design is not None
     assert load_blueprint is not None
     assert plot_pattern is not None
