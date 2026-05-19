@@ -11,6 +11,7 @@ from .core import SliceBlueprint, load_blueprint
 
 
 ALLOWED_MOTIFS = {"layered", "gradient", "hotspot", "ring", "clustered", "diffuse"}
+_AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
 
 def _coerce_gene_names(gene_names: Sequence[str]) -> list[str]:
@@ -147,20 +148,33 @@ def diffuse_quantile_map(
     return smoothed[:, 0] if squeeze else smoothed
 
 
-def _coerce_centers(centers: Any) -> np.ndarray:
+def _axis_index(axis_name: str, coordinate_dim: int) -> int:
+    axis = _AXIS_INDEX.get(str(axis_name).lower().strip())
+    if axis is None:
+        raise ValueError("axis must be one of {'x', 'y', 'z'}.")
+    if axis >= int(coordinate_dim):
+        raise ValueError(f"axis '{axis_name}' requires {axis + 1}D coordinates.")
+    return axis
+
+
+def _default_center(coordinate_dim: int) -> list[float]:
+    return [0.5] * int(coordinate_dim)
+
+
+def _coerce_centers(centers: Any, coordinate_dim: int) -> np.ndarray:
     arr = np.asarray(centers, dtype=float)
     if arr.ndim == 1:
-        if arr.shape[0] != 2:
-            raise ValueError("center must have two coordinates.")
-        arr = arr.reshape(1, 2)
-    if arr.ndim != 2 or arr.shape[1] != 2:
-        raise ValueError("centers must be an array of shape (n, 2).")
+        if arr.shape[0] != int(coordinate_dim):
+            raise ValueError(f"center must have {int(coordinate_dim)} coordinates.")
+        arr = arr.reshape(1, int(coordinate_dim))
+    if arr.ndim != 2 or arr.shape[1] != int(coordinate_dim):
+        raise ValueError(f"centers must be an array of shape (n, {int(coordinate_dim)}).")
     return arr
 
 
 def _layered_pattern(coords: np.ndarray, motif: Mapping[str, Any]) -> np.ndarray:
     axis_name = str(motif.get("axis", "y")).lower().strip()
-    axis = 0 if axis_name == "x" else 1
+    axis = _axis_index(axis_name, coords.shape[1])
     centers = motif.get("centers", motif.get("center", 0.5))
     centers_arr = np.atleast_1d(np.asarray(centers, dtype=float)).reshape(-1)
     width = max(float(motif.get("width", 0.18)), 1e-6)
@@ -172,16 +186,18 @@ def _layered_pattern(coords: np.ndarray, motif: Mapping[str, Any]) -> np.ndarray
 
 def _gradient_pattern(coords: np.ndarray, motif: Mapping[str, Any]) -> np.ndarray:
     axis_name = str(motif.get("axis", "x")).lower().strip()
-    if axis_name in {"x", "y"}:
-        axis = 0 if axis_name == "x" else 1
+    if axis_name in _AXIS_INDEX:
+        axis = _axis_index(axis_name, coords.shape[1])
         values = coords[:, axis].copy()
     else:
-        direction = np.asarray(motif.get("direction", [1.0, 0.0]), dtype=float).reshape(-1)
-        if direction.shape[0] != 2:
-            raise ValueError("gradient direction must have two components.")
+        default_direction = np.zeros(coords.shape[1], dtype=float)
+        default_direction[0] = 1.0
+        direction = np.asarray(motif.get("direction", default_direction), dtype=float).reshape(-1)
+        if direction.shape[0] != coords.shape[1]:
+            raise ValueError(f"gradient direction must have {coords.shape[1]} components.")
         norm = np.linalg.norm(direction)
         if norm <= 1e-8:
-            direction = np.array([1.0, 0.0], dtype=float)
+            direction = default_direction
             norm = 1.0
         direction = direction / norm
         values = coords @ direction
@@ -192,7 +208,7 @@ def _gradient_pattern(coords: np.ndarray, motif: Mapping[str, Any]) -> np.ndarra
 
 
 def _hotspot_pattern(coords: np.ndarray, motif: Mapping[str, Any]) -> np.ndarray:
-    center = _coerce_centers(motif.get("center", [0.5, 0.5]))[0]
+    center = _coerce_centers(motif.get("center", _default_center(coords.shape[1])), coords.shape[1])[0]
     radius = max(float(motif.get("radius", 0.18)), 1e-6)
     dist = np.linalg.norm(coords - center[None, :], axis=1)
     values = np.exp(-0.5 * (dist / radius) ** 2)
@@ -200,7 +216,7 @@ def _hotspot_pattern(coords: np.ndarray, motif: Mapping[str, Any]) -> np.ndarray
 
 
 def _ring_pattern(coords: np.ndarray, motif: Mapping[str, Any]) -> np.ndarray:
-    center = _coerce_centers(motif.get("center", [0.5, 0.5]))[0]
+    center = _coerce_centers(motif.get("center", _default_center(coords.shape[1])), coords.shape[1])[0]
     radius = float(motif.get("radius", 0.3))
     width = max(float(motif.get("width", 0.08)), 1e-6)
     dist = np.linalg.norm(coords - center[None, :], axis=1)
@@ -212,9 +228,9 @@ def _clustered_pattern(coords: np.ndarray, motif: Mapping[str, Any], rng: np.ran
     centers = motif.get("centers")
     if centers is None:
         n_clusters = max(int(motif.get("n_clusters", 3)), 1)
-        centers_arr = rng.random((n_clusters, 2), dtype=np.float64)
+        centers_arr = rng.random((n_clusters, coords.shape[1]), dtype=np.float64)
     else:
-        centers_arr = _coerce_centers(centers)
+        centers_arr = _coerce_centers(centers, coords.shape[1])
     radius = max(float(motif.get("radius", 0.12)), 1e-6)
     values = np.zeros(coords.shape[0], dtype=float)
     for center in centers_arr:
@@ -226,7 +242,7 @@ def _clustered_pattern(coords: np.ndarray, motif: Mapping[str, Any], rng: np.ran
 def _diffuse_pattern(coords: np.ndarray, motif: Mapping[str, Any], rng: np.random.Generator) -> np.ndarray:
     n_components = max(int(motif.get("n_components", 6)), 1)
     length_scale = max(float(motif.get("length_scale", 0.3)), 1e-6)
-    centers = rng.random((n_components, 2), dtype=np.float64)
+    centers = rng.random((n_components, coords.shape[1]), dtype=np.float64)
     weights = rng.uniform(0.5, 1.0, size=n_components)
     values = np.zeros(coords.shape[0], dtype=float)
     for weight, center in zip(weights, centers):

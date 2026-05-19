@@ -83,6 +83,8 @@ class FEAST:
         n_jobs: int = -1,
         alteration_config: Optional[Any] = None,
         boundary_multiplier: float = 1.1,
+        simulation_mode: str = "generative",
+        random_seed: Optional[int] = None,
     ) -> ad.AnnData:
         if verbose is None:
             verbose = self.verbose
@@ -102,6 +104,8 @@ class FEAST:
             n_jobs=n_jobs,
             alteration_config=alteration_config,
             boundary_multiplier=boundary_multiplier,
+            simulation_mode=simulation_mode,
+            random_seed=random_seed,
         )
 
     def simulate_alignment(
@@ -134,6 +138,8 @@ class FEAST:
         n_jobs: int = -1,
         alteration_config: Optional[Any] = None,
         boundary_multiplier: float = 1.1,
+        simulation_mode: str = "generative",
+        random_seed: Optional[int] = None,
         verbose: Optional[bool] = None,
     ) -> tuple:
         if verbose is None:
@@ -153,6 +159,8 @@ class FEAST:
             "n_jobs": n_jobs,
             "alteration_config": alteration_config,
             "boundary_multiplier": boundary_multiplier,
+            "simulation_mode": simulation_mode,
+            "random_seed": random_seed,
             "verbose": verbose,
         }
         if fit_params:
