@@ -9,11 +9,21 @@ import pandas as pd
 
 from ..FEAST_core.count_decoding import decode_counts_from_quantiles, resolve_decode_method
 from .conditional import VirtualSliceGenerationConfig
-from .core import SliceBlueprint, load_blueprint
+from .core import SliceBlueprint, active_mask_metadata, assign_generated_coordinates, load_blueprint
 from .pattern import compose_gene_pattern, diffuse_quantile_map
 
 
 REQUIRED_STATS_COLUMNS = ("mean", "variance", "zero_prop")
+
+
+def _apply_coordinate_scale(coords: np.ndarray, coordinate_scale: Optional[Sequence[float]]) -> np.ndarray:
+    arr = np.asarray(coords, dtype=float)
+    if coordinate_scale is None:
+        return arr.copy()
+    scale = np.asarray(coordinate_scale, dtype=float).reshape(-1)
+    if scale.shape[0] != arr.shape[1]:
+        raise ValueError(f"coordinate_scale must contain {arr.shape[1]} values.")
+    return arr * scale[None, :]
 
 
 def _coerce_gene_names(gene_names: Sequence[str]) -> list[str]:
@@ -154,7 +164,9 @@ class BlueprintBuilder:
         coords = np.asarray(coordinates, dtype=float)
         if coords.ndim != 2 or coords.shape[1] < 2:
             raise ValueError("coordinates must be a 2D array with at least two columns.")
-        self._coordinates = coords[:, :2]
+        if coords.shape[1] > 3:
+            raise ValueError("coordinates supports only 2D or 3D coordinates in v1.")
+        self._coordinates = coords.copy()
         self._coordinate_mode = str(coordinate_mode)
         self._grid_type = str(grid_type)
         self._technology = technology
@@ -188,6 +200,37 @@ class BlueprintBuilder:
         xx, yy = np.meshgrid(xs, ys)
         coords = np.column_stack([xx.ravel(), yy.ravel()])
         return cls(coords, coordinate_mode="grid", grid_type="rectangular", technology=technology)
+
+    @classmethod
+    def cuboid_grid(
+        cls,
+        n_x: int,
+        n_y: int,
+        n_z: int,
+        *,
+        spacing: Union[float, Sequence[float]] = 1.0,
+        origin: Sequence[float] = (0.0, 0.0, 0.0),
+        technology: Optional[str] = None,
+    ) -> "BlueprintBuilder":
+        if int(n_x) <= 0 or int(n_y) <= 0 or int(n_z) <= 0:
+            raise ValueError("n_x, n_y, and n_z must be positive.")
+        if np.isscalar(spacing):
+            dx = dy = dz = float(spacing)
+        else:
+            spacing_values = [float(item) for item in spacing]
+            if len(spacing_values) != 3:
+                raise ValueError("3D spacing must contain exactly three values.")
+            dx, dy, dz = spacing_values
+        origin_values = [float(item) for item in origin]
+        if len(origin_values) != 3:
+            raise ValueError("3D origin must contain exactly three values.")
+        ox, oy, oz = origin_values
+        xs = np.arange(int(n_x), dtype=float) * dx + ox
+        ys = np.arange(int(n_y), dtype=float) * dy + oy
+        zs = np.arange(int(n_z), dtype=float) * dz + oz
+        xx, yy, zz = np.meshgrid(xs, ys, zs, indexing="xy")
+        coords = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])
+        return cls(coords, coordinate_mode="grid", grid_type="cuboid", technology=technology)
 
     def set_domains(self, domains: Sequence[Any], *, key: str = "domain") -> "BlueprintBuilder":
         values = np.asarray(domains)
@@ -318,7 +361,9 @@ def generate_virtual_slice_from_design(
     pattern_spec: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
     label_key: str = "domain",
 ) -> ad.AnnData:
-    bp = _ensure_design_blueprint(blueprint, label_key=label_key)
+    original_bp = _ensure_design_blueprint(blueprint, label_key=label_key)
+    mask_metadata = active_mask_metadata(original_bp)
+    bp = original_bp.active_subset()
     gen_cfg = config or VirtualSliceGenerationConfig()
     gene_names = _extract_gene_names_from_cloud(parameter_cloud)
     n_spots = bp.n_spots
@@ -329,8 +374,16 @@ def generate_virtual_slice_from_design(
 
     if quantiles is not None:
         quantiles_arr = np.asarray(quantiles, dtype=np.float32)
-        if quantiles_arr.shape != (n_spots, n_genes):
-            raise ValueError(f"quantiles must have shape {(n_spots, n_genes)}, got {quantiles_arr.shape}.")
+        if quantiles_arr.shape == (original_bp.n_spots, n_genes):
+            quantiles_arr = quantiles_arr[original_bp.active_indices, :]
+        elif quantiles_arr.shape == (n_spots, n_genes):
+            quantiles_arr = quantiles_arr.copy()
+        else:
+            raise ValueError(
+                "quantiles must have shape "
+                f"{(original_bp.n_spots, n_genes)} before masking or {(n_spots, n_genes)} after masking, "
+                f"got {quantiles_arr.shape}."
+            )
         quantiles_arr = np.clip(quantiles_arr, 0.0, 1.0)
     else:
         rng = np.random.default_rng(int(random_seed))
@@ -349,7 +402,7 @@ def generate_virtual_slice_from_design(
 
     quantiles_arr = diffuse_quantile_map(
         quantiles_arr,
-        bp.coordinates,
+        _apply_coordinate_scale(bp.coordinates, gen_cfg.coordinate_scale),
         float(gen_cfg.diffusion_level),
     ).astype(np.float32, copy=False)
 
@@ -396,7 +449,6 @@ def generate_virtual_slice_from_design(
     result = ad.AnnData(X=counts, obs=obs, var=var)
     result.layers["counts"] = counts.astype(np.int32, copy=False)
     result.layers["transported_quantiles"] = quantiles_arr.astype(np.float32, copy=False)
-    result.obsm["spatial"] = np.asarray(bp.coordinates, dtype=float).copy()
     result.uns["de_novo"] = {
         "conditional_generation": False,
         "designed_generation": True,
@@ -408,7 +460,9 @@ def generate_virtual_slice_from_design(
         "assignment_randomness": float(gen_cfg.assignment_randomness),
         "parameter_cloud_summary": label_cloud_summary,
         "reference_metadata": {"mode": "design", "labels": sorted(np.unique(labels).tolist())},
+        "mask": mask_metadata,
     }
+    assign_generated_coordinates(result, bp.coordinates)
     result.uns["target_blueprint"] = bp.to_dict()
     if pattern_spec is not None:
         result.uns["de_novo"]["pattern_spec"] = {

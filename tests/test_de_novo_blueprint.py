@@ -12,7 +12,7 @@ def test_blueprint_validation_and_roundtrip():
         obs=pd.DataFrame({"quality": [1, 2]}),
         metadata={"source": "test"},
     )
-    assert bp.coordinates.shape == (2, 2)
+    assert bp.coordinates.shape == (2, 3)
     assert list(bp.obs["domain"]) == ["a", "b"]
     loaded = load_blueprint(bp.to_dict())
     assert loaded.n_spots == 2

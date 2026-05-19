@@ -2,8 +2,17 @@ import scanpy as sc
 import anndata as ad
 import numpy as np
 import pandas as pd
+import warnings
 
-from .parameter_cloud import GeneParameterSimulator, convert_params_for_new_simulator
+from .count_decoding import decode_counts_from_quantiles
+from .parameter_cloud import (
+    STAT_COLUMNS,
+    GeneParameterSimulator,
+    alteration_config_to_dict,
+    calculate_fold_change,
+    convert_params_for_new_simulator,
+    resolve_simulation_mode,
+)
 
 
 def safe_calculate_qc_metrics(adata, verbose=False):
@@ -16,9 +25,45 @@ def safe_calculate_qc_metrics(adata, verbose=False):
         adata.var['total_counts'] = np.asarray(adata.X.sum(axis=0)).flatten()
         adata.var['n_cells_by_counts'] = np.asarray((adata.X > 0).sum(axis=0)).flatten()
 
-def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_search=True, min_accepted_error=0.5, assignment_weights=None, screening_pool_size=100, top_n_to_fully_evaluate=10, n_jobs=-1, alteration_config=None):
+def _dense_matrix(X, dtype=None):
+    if hasattr(X, 'toarray'):
+        X = X.toarray()
+    arr = np.asarray(X)
+    if dtype is not None:
+        arr = arr.astype(dtype, copy=False)
+    return arr
+
+
+def _gene_stats_from_matrix(matrix, gene_names) -> pd.DataFrame:
+    matrix = np.asarray(matrix, dtype=np.float64)
+    n_obs = matrix.shape[0]
+    return pd.DataFrame({
+        'mean': np.mean(matrix, axis=0),
+        'variance': np.var(matrix, axis=0),
+        'zero_prop': 1 - (np.count_nonzero(matrix, axis=0) / n_obs),
+    }, index=pd.Index(gene_names, name='gene_id')).clip(lower=1e-10)
+
+
+def _model_selection_counts(model_params: dict) -> dict:
+    selected = np.asarray(model_params.get('model_selected', []), dtype=object)
+    return {str(model): int(np.sum(selected == model)) for model in sorted(set(selected.tolist()))}
+
+
+def _hdf5_safe_metadata(value):
+    if value is None:
+        return "none"
+    if isinstance(value, dict):
+        return {str(k): _hdf5_safe_metadata(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_hdf5_safe_metadata(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_search=True, min_accepted_error=0.5, assignment_weights=None, screening_pool_size=100, top_n_to_fully_evaluate=10, n_jobs=-1, alteration_config=None, simulation_mode='generative', random_seed=None):
     """
-    UPDATED: Calls the new two-stage, parallelized heuristic search with optional marginal distribution alteration.
+    Build an integrated FEAST gene-parameter table and convert it to count-model parameters.
     
     Args:
         alteration_config (AlterationConfig or dict, optional): Configuration for altering marginal distributions
@@ -27,34 +72,40 @@ def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_searc
     
     if assignment_weights is None:
         assignment_weights = {'mean': 1, 'variance': 1, 'zero_prop': 1.0}
+    mode = resolve_simulation_mode(simulation_mode)
+    if use_heuristic_search:
+        warnings.warn(
+            "use_heuristic_search is retained for compatibility but is ignored by the "
+            "integrated simulation_mode pipeline; generative mode uses Copula-rank OT.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
     simulator = GeneParameterSimulator()
-    simulator.fit(adata, visualize_fits=visualize_fits)
-    
-    # Apply marginal distribution alterations if requested
-    if alteration_config is not None:
-        simulator.alter_marginal_distributions(alteration_config=alteration_config, verbose=True)
-    
-    if use_heuristic_search:
-        print("--- Activating Boosted Heuristic Optimization Mode ---")
-        assigned_synthetic_params = simulator.run_heuristic_search(
-            n_genes=adata.n_vars,
-            min_accepted_error=min_accepted_error,
-            assignment_weights=assignment_weights,
-            screening_pool_size=screening_pool_size,
-            top_n_to_fully_evaluate=top_n_to_fully_evaluate,
-            n_jobs=n_jobs
-        )
+    if mode == 'empirical':
+        simulator.fit_statistics_only(adata)
     else:
-        print("--- Using Standard Single-Shot Assignment ---")
-        synthetic_params = simulator.simulate(n_genes=adata.n_vars)
-        assigned_synthetic_params = simulator.assign_to_genes(
-            synthetic_params, 
-            weights=assignment_weights
-        )
+        simulator.fit(adata, visualize_fits=visualize_fits)
+
+    assigned_synthetic_params, diagnostics = simulator.build_gene_parameter_table(
+        alteration_config=alteration_config,
+        simulation_mode=mode,
+        assignment_weights=assignment_weights,
+        random_seed=random_seed,
+        verbose=True,
+    )
 
     model_params = convert_params_for_new_simulator(assigned_synthetic_params)
-    model_params['simulation_evaluation'] = {'source': 'parameter_cloud_v2_robust_boosted'}
+    model_params['simulation_evaluation'] = {
+        'source': 'integrated_parameter_cloud',
+        'simulation_mode': mode,
+    }
+    model_params['simulation_mode'] = mode
+    model_params['random_seed'] = None if random_seed is None else int(random_seed)
+    model_params['target_stats'] = assigned_synthetic_params
+    model_params['parameter_diagnostics'] = diagnostics
+    model_params['count_decode_method'] = 'quantile'
+    model_params['quantile_calibration'] = 'reference_rank' if mode == 'empirical' else 'raw'
     print(">>> Exiting parameter_cloud pipeline <<<\n")
     return model_params
 
@@ -65,7 +116,11 @@ def run_direct_fitting_from_real_stats(adata):
     simulator.fit_statistics_only(adata)
     real_stats_for_conversion = simulator.original_stats.reset_index().rename(columns={'index': 'gene_id'})
     model_params = convert_params_for_new_simulator(real_stats_for_conversion)
-    model_params['simulation_evaluation'] = {'source': 'direct_from_real_stats'}
+    model_params['simulation_evaluation'] = {'source': 'direct_from_real_stats', 'simulation_mode': 'empirical'}
+    model_params['simulation_mode'] = 'empirical'
+    model_params['target_stats'] = real_stats_for_conversion
+    model_params['count_decode_method'] = 'quantile'
+    model_params['quantile_calibration'] = 'reference_rank'
     print(">>> Diagnostic fitting complete <<<\n")
     return model_params
 
@@ -78,7 +133,7 @@ class SpatialSimulator:
         self.reference_adata.obs_names_make_unique()
         self._model_params = model_params
 
-    def fit_model(self, visualize_fits: bool = False, use_real_stats_directly: bool = False, use_heuristic_search: bool = False, min_accepted_error: float = 0.5, assignment_weights: dict = None, screening_pool_size: int = 100, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None) -> 'SpatialSimulator':
+    def fit_model(self, visualize_fits: bool = False, use_real_stats_directly: bool = False, use_heuristic_search: bool = False, min_accepted_error: float = 0.5, assignment_weights: dict = None, screening_pool_size: int = 100, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, simulation_mode: str = 'generative', random_seed: int = None) -> 'SpatialSimulator':
         """
         UPDATED: Exposes the new boosted heuristic search parameters and marginal distribution alteration.
         
@@ -98,7 +153,9 @@ class SpatialSimulator:
                 screening_pool_size=screening_pool_size,
                 top_n_to_fully_evaluate=top_n_to_fully_evaluate,
                 n_jobs=n_jobs,
-                alteration_config=alteration_config
+                alteration_config=alteration_config,
+                simulation_mode=simulation_mode,
+                random_seed=random_seed,
             )
         return self
     
@@ -111,33 +168,151 @@ class SpatialSimulator:
         """Get current model parameters."""
         return self._model_params
     
-    def simulate(self, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.0, boundary_multiplier: float = 1.1) -> ad.AnnData:
+    def simulate(self, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.0, boundary_multiplier: float = 1.1, random_seed: int = None) -> ad.AnnData:
         """
         Args:
             num_simulation_cores (int): Number of cores for simulation (legacy parameter).
             verbose (bool): If True, prints progress updates.
             clip_overshoot_factor (float): Factor to clip max expression values relative to reference.
             boundary_multiplier (float): Multiplier for maximum count boundary constraint (default 1.1 = 110% of reference max).
+            random_seed (int, optional): Seed for raw generative quantile decoding.
         """
         if self._model_params is None:
             raise ValueError("Model parameters not set. Call fit_model() first or provide model_params in constructor.")
         
         if verbose:
-            print("Generating simulated data with deterministic rank preservation...")
+            print("Generating simulated data with quantile count decoding...")
         
-        simulated_adata = self._apply_deterministic_rank_assignment(
+        simulated_adata = self._apply_quantile_count_decoding(
             reference_adata=self.reference_adata,
             model_params=self._model_params,
             verbose=verbose,
             clip_overshoot_factor=clip_overshoot_factor,
-            boundary_multiplier=boundary_multiplier
+            boundary_multiplier=boundary_multiplier,
+            random_seed=random_seed,
         )
         
         if verbose:
-            print(f"Deterministic simulation complete for {simulated_adata.n_obs} spots and {simulated_adata.n_vars} genes")
+            print(f"Quantile simulation complete for {simulated_adata.n_obs} spots and {simulated_adata.n_vars} genes")
         
         safe_calculate_qc_metrics(simulated_adata)
         return simulated_adata
+
+    def _apply_quantile_count_decoding(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, random_seed=None):
+        """Generate counts from model parameters through the integrated quantile decoder."""
+        reference_matrix = _dense_matrix(reference_adata.X, dtype=np.float64)
+        spatial_coords = reference_adata.obsm['spatial']
+        n_spots, n_genes = reference_matrix.shape
+
+        mode = resolve_simulation_mode(model_params.get('simulation_mode', 'empirical'))
+        diagnostics_seed = model_params.get('random_seed', None)
+        seed = random_seed if random_seed is not None else diagnostics_seed
+        quantile_calibration = model_params.get(
+            'quantile_calibration',
+            'reference_rank' if mode == 'empirical' else 'raw',
+        )
+
+        if quantile_calibration == 'reference_rank':
+            quantile_input = reference_matrix
+            decoder_calibration = 'rank'
+        elif quantile_calibration == 'raw':
+            rng = np.random.default_rng(None if seed is None else int(seed))
+            quantile_input = rng.random((n_spots, n_genes), dtype=np.float64)
+            decoder_calibration = 'raw'
+        else:
+            raise ValueError("quantile_calibration must be 'reference_rank' or 'raw' for integrated simulation.")
+
+        simulated_matrix = decode_counts_from_quantiles(
+            quantile_input,
+            model_params,
+            method='quantile',
+            quantile_calibration=decoder_calibration,
+            boundary_multiplier=boundary_multiplier,
+            reference_X=reference_matrix,
+            random_seed=seed,
+        ).astype(np.float32, copy=False)
+
+        boundary_clipped_gene_count = 0
+        if clip_overshoot_factor > 0:
+            max_ref_counts = np.max(reference_matrix, axis=0)
+            clip_max = max_ref_counts * (1 + clip_overshoot_factor)
+            before = simulated_matrix.copy()
+            simulated_matrix = np.clip(simulated_matrix, 0, clip_max)
+            boundary_clipped_gene_count = int(np.any(np.abs(before - simulated_matrix) > 1e-12, axis=0).sum())
+
+        simulated_adata = ad.AnnData(
+            X=simulated_matrix.astype(np.float32),
+            obs=reference_adata.obs.copy(),
+            var=reference_adata.var.copy(),
+            obsm={'spatial': spatial_coords.copy()}
+        )
+        simulated_adata.uns['simulation_method'] = 'Quantile_Count_Decoding'
+        simulated_adata.uns['simulation_params'] = {
+            'clip_overshoot_factor': float(clip_overshoot_factor),
+            'boundary_multiplier': float(boundary_multiplier),
+            'simulation_mode': mode,
+            'random_seed': "none" if seed is None else int(seed),
+        }
+        simulated_adata.uns['simulation_diagnostics'] = _hdf5_safe_metadata(self._build_simulation_diagnostics(
+            reference_matrix=reference_matrix,
+            simulated_matrix=simulated_matrix,
+            model_params=model_params,
+            simulation_mode=mode,
+            quantile_calibration=quantile_calibration,
+            random_seed=seed,
+            boundary_clipped_gene_count=boundary_clipped_gene_count,
+            clip_overshoot_factor=clip_overshoot_factor,
+        ))
+        if model_params.get('parameter_diagnostics', {}).get('requested_config') is not None:
+            simulated_adata.uns['alteration_diagnostics'] = _hdf5_safe_metadata({
+                'requested_config': model_params['parameter_diagnostics'].get('requested_config'),
+                'target_stage_achieved_change': model_params['parameter_diagnostics'].get('target_stage_achieved_change'),
+                'realized_stage_achieved_change': simulated_adata.uns['simulation_diagnostics'].get('realized_stage_achieved_change'),
+            })
+        return simulated_adata
+
+    def _build_simulation_diagnostics(
+        self,
+        reference_matrix,
+        simulated_matrix,
+        model_params,
+        simulation_mode,
+        quantile_calibration,
+        random_seed,
+        boundary_clipped_gene_count,
+        clip_overshoot_factor,
+    ):
+        reference_stats = _gene_stats_from_matrix(reference_matrix, self.reference_adata.var_names)
+        realized_stats = _gene_stats_from_matrix(simulated_matrix, self.reference_adata.var_names)
+        target_stats = model_params.get('target_stats')
+        target_change = None
+        if isinstance(target_stats, pd.DataFrame):
+            target_change = calculate_fold_change(reference_stats, target_stats)
+
+        parameter_diagnostics = model_params.get('parameter_diagnostics', {})
+        diagnostics = {
+            'simulation_mode': simulation_mode,
+            'gene_parameter_engine': parameter_diagnostics.get('gene_parameter_engine', simulation_mode),
+            'assignment_method': parameter_diagnostics.get(
+                'assignment_method',
+                'identity' if simulation_mode == 'empirical' else 'copula_rank_ot',
+            ),
+            'count_decode_method': 'quantile',
+            'quantile_calibration': quantile_calibration,
+            'random_seed': None if random_seed is None else int(random_seed),
+            'requested_config': parameter_diagnostics.get('requested_config'),
+            'target_fold_change': parameter_diagnostics.get('target_fold_change'),
+            'target_stage_achieved_change': target_change or parameter_diagnostics.get('target_stage_achieved_change'),
+            'realized_stage_achieved_change': calculate_fold_change(reference_stats, realized_stats),
+            'copula_rank_diagnostics': parameter_diagnostics.get('copula_rank_diagnostics', {}),
+            'moment_feasibility': parameter_diagnostics.get('moment_feasibility', {'infeasible_gene_count': 0}),
+            'boundary_clipping': {
+                'clip_overshoot_factor': float(clip_overshoot_factor),
+                'clipped_gene_count': int(boundary_clipped_gene_count),
+            },
+            'model_selection_counts': _model_selection_counts(model_params),
+        }
+        return diagnostics
     
     def _apply_deterministic_rank_assignment(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, n_modules=30, n_neighbors=6):
         """Generate counts from model parameters while preserving per-gene reference ranks."""
@@ -617,6 +792,8 @@ class SpatialSimulator:
             "top_n_to_fully_evaluate": kwargs.get("top_n_to_fully_evaluate", 10),
             "n_jobs": kwargs.get("n_jobs", -1),
             "alteration_config": kwargs.get("alteration_config"),
+            "simulation_mode": kwargs.get("simulation_mode", "generative"),
+            "random_seed": kwargs.get("random_seed"),
         }
         self.fit_model(**fit_kwargs)
         simulated = self.simulate(
@@ -624,14 +801,15 @@ class SpatialSimulator:
             verbose=kwargs.get("verbose", True),
             clip_overshoot_factor=kwargs.get("clip_overshoot_factor", 0.1),
             boundary_multiplier=kwargs.get("boundary_multiplier", 1.1),
+            random_seed=kwargs.get("random_seed"),
         )
         simulated.uns["annotation_key"] = annotation_key
         return simulated
     
 
-def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1) -> ad.AnnData:
+def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, simulation_mode: str = 'generative', random_seed: int = None) -> ad.AnnData:
     """
-    Run deterministic single-slice simulation with optional marginal distribution alteration.
+    Run single-slice simulation with explicit generative or empirical semantics.
     
     Args:
         boundary_multiplier (float): Multiplier for maximum count boundary constraint (default 1.1 = 110% of reference max).
@@ -648,8 +826,11 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
                     apply_to_mean=True,
                     apply_to_variance=True
                 )
+        simulation_mode: "generative" by default, or "empirical" for strict controlled alteration.
+        random_seed: Optional seed for reproducible generative sampling and quantile decoding.
         Other parameters: See individual parameter documentation in fit_model() and simulate() methods.
     """
+    simulation_mode = resolve_simulation_mode(simulation_mode)
     if verbose: print("Starting comprehensive single slice simulation...")
     adata = adata.copy()
     safe_calculate_qc_metrics(adata, verbose=verbose)
@@ -662,7 +843,9 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
         'assignment_weights': assignment_weights,
         'screening_pool_size': screening_pool_size,
         'top_n_to_fully_evaluate': top_n_to_fully_evaluate,
-        'n_jobs': n_jobs
+        'n_jobs': n_jobs,
+        'simulation_mode': simulation_mode,
+        'random_seed': random_seed,
     }
 
     if annotation_key:
@@ -674,6 +857,8 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
             num_simulation_cores=num_simulation_cores, 
             verbose=verbose, 
             clip_overshoot_factor=clip_overshoot_factor, 
+            boundary_multiplier=boundary_multiplier,
+            alteration_config=alteration_config,
             **heuristic_kwargs, # Pass all heuristic controls
         )
 
@@ -697,7 +882,8 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
             num_simulation_cores=num_simulation_cores, 
             verbose=verbose, 
             clip_overshoot_factor=clip_overshoot_factor,
-            boundary_multiplier=boundary_multiplier
+            boundary_multiplier=boundary_multiplier,
+            random_seed=random_seed,
         )
         
     if verbose: print(f"\nSimulation completed successfully!")
