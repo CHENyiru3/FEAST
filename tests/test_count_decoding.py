@@ -9,6 +9,7 @@ from FEAST.FEAST_core.count_decoding import (
     resolve_decode_method,
     resolve_quantile_calibration,
 )
+from FEAST.FEAST_core.count_modeling import stats_frame_to_model_params
 
 
 def _model_params():
@@ -92,3 +93,21 @@ def test_rank_decode_and_spot_weight_validation():
     assert np.all(decoded >= 0)
     with pytest.raises(ValueError):
         decode_counts_from_quantiles(q, _model_params(), spot_weights=np.ones(2))
+
+
+def test_shared_count_model_converter_reports_moment_diagnostics():
+    import pandas as pd
+
+    stats = pd.DataFrame(
+        {
+            "mean": [2.0, 5.0],
+            "variance": [3.0, 15.0],
+            "zero_prop": [0.1, 0.4],
+        },
+        index=["g1", "g2"],
+    )
+    params = stats_frame_to_model_params(stats)
+    assert params["genes"] == {0: "g1", 1: "g2"}
+    assert len(params["model_selected"]) == 2
+    assert "model_moment_diagnostics" in params
+    assert params["model_moment_diagnostics"]["max_log_moment_error"] >= 0.0

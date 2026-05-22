@@ -62,6 +62,7 @@ adata = sc.read_h5ad("your_spatial_data.h5ad")
 # Simple simulation with default parameters
 simulated_adata = simulator.simulate_single_slice(
     adata=adata,
+    assignment_method="ot",  # or "rank" for direct rank-preserving assignment
     verbose=True
 )
 
@@ -71,7 +72,9 @@ from FEAST.modeling.marginal_alteration import AlterationConfig
 alteration_config = AlterationConfig.mean_only(fold_change=2.0)
 altered_adata = simulator.simulate_single_slice(
     adata=adata,
-    alteration_config=alteration_config
+    alteration_config=alteration_config,
+    annotation_key="region",      # optional; defaults to stratified simulation by label
+    annotation_mode="stratified"  # use "global" for legacy global fitting
 )
 ```
 
@@ -132,6 +135,17 @@ virtual_slice = de_novo.simulate_from_design(
     random_seed=7,
 )
 ```
+
+### Simulator methodology
+
+FEAST uses the same mathematical pipeline for single-reference and de novo simulation:
+
+1. Estimate or provide gene-level statistics `s_g = (mean_g, variance_g, zero_prop_g)`.
+2. Convert each `s_g` into a moment-matched count model `F_g` using the shared Poisson/NB/ZIP/ZINB converter.
+3. Construct a spatial quantile field `Q_ig` from reference ranks, optimal-transported reference quantiles, or de novo design motifs.
+4. Decode counts with `X_ig = F_g^{-1}(Q_ig)` and apply the configured count boundary.
+
+For single-reference simulation, `assignment_method="ot"` transports the reference quantile field over the reference coordinates before decoding. When source and target coordinates are the same, this is the OT limit of rank preservation; `assignment_method="rank"` is available when users want the direct rank-preserving assignment. Target-coordinate virtual generation remains in `FEAST.de_novo.simulate_from_reference`, which is the intended route for more complex virtual slice generation.
 
 ##  Tutorials
 

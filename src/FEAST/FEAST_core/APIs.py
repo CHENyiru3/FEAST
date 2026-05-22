@@ -72,9 +72,10 @@ class FEAST:
         visualize_fits: bool = False,
         num_simulation_cores: int = 12,
         verbose: Optional[bool] = None,
-        clip_overshoot_factor: float = 0.1,
+        clip_overshoot_factor: float = 0.0,
         use_real_stats_directly: bool = False,
         annotation_key: Optional[str] = None,
+        annotation_mode: str = "stratified",
         use_heuristic_search: bool = False,
         min_accepted_error: float = 0.5,
         assignment_weights: Optional[Dict] = None,
@@ -85,6 +86,7 @@ class FEAST:
         boundary_multiplier: float = 1.1,
         simulation_mode: str = "generative",
         random_seed: Optional[int] = None,
+        assignment_method: str = "ot",
     ) -> ad.AnnData:
         if verbose is None:
             verbose = self.verbose
@@ -96,6 +98,7 @@ class FEAST:
             clip_overshoot_factor=clip_overshoot_factor,
             use_real_stats_directly=use_real_stats_directly,
             annotation_key=annotation_key,
+            annotation_mode=annotation_mode,
             use_heuristic_search=use_heuristic_search,
             min_accepted_error=min_accepted_error,
             assignment_weights=assignment_weights,
@@ -106,6 +109,7 @@ class FEAST:
             boundary_multiplier=boundary_multiplier,
             simulation_mode=simulation_mode,
             random_seed=random_seed,
+            assignment_method=assignment_method,
         )
 
     def simulate_alignment(
@@ -127,9 +131,10 @@ class FEAST:
         expression_params: Optional[Dict] = None,
         visualize_fits: bool = False,
         num_simulation_cores: int = 12,
-        clip_overshoot_factor: float = 0.1,
+        clip_overshoot_factor: float = 0.0,
         use_real_stats_directly: bool = False,
         annotation_key: Optional[str] = None,
+        annotation_mode: str = "stratified",
         use_heuristic_search: bool = False,
         min_accepted_error: float = 0.5,
         assignment_weights: Optional[Dict] = None,
@@ -140,6 +145,7 @@ class FEAST:
         boundary_multiplier: float = 1.1,
         simulation_mode: str = "generative",
         random_seed: Optional[int] = None,
+        assignment_method: str = "ot",
         verbose: Optional[bool] = None,
     ) -> tuple:
         if verbose is None:
@@ -151,6 +157,7 @@ class FEAST:
             "clip_overshoot_factor": clip_overshoot_factor,
             "use_real_stats_directly": use_real_stats_directly,
             "annotation_key": annotation_key,
+            "annotation_mode": annotation_mode,
             "use_heuristic_search": use_heuristic_search,
             "min_accepted_error": min_accepted_error,
             "assignment_weights": assignment_weights,
@@ -161,6 +168,7 @@ class FEAST:
             "boundary_multiplier": boundary_multiplier,
             "simulation_mode": simulation_mode,
             "random_seed": random_seed,
+            "assignment_method": assignment_method,
             "verbose": verbose,
         }
         if fit_params:

@@ -5,6 +5,12 @@ import pandas as pd
 import warnings
 
 from .count_decoding import decode_counts_from_quantiles
+from .spatial_assignment import (
+    calculate_quantiles,
+    normalize_coordinates,
+    solve_spatial_transport,
+    transport_quantiles,
+)
 from .parameter_cloud import (
     STAT_COLUMNS,
     GeneParameterSimulator,
@@ -13,6 +19,24 @@ from .parameter_cloud import (
     convert_params_for_new_simulator,
     resolve_simulation_mode,
 )
+
+
+SPOT_ASSIGNMENT_METHODS = ("ot", "rank")
+ANNOTATION_MODES = ("stratified", "global")
+
+
+def resolve_assignment_method(assignment_method: str = "ot") -> str:
+    method = str(assignment_method).lower().strip()
+    if method not in SPOT_ASSIGNMENT_METHODS:
+        raise ValueError("assignment_method must be 'ot' or 'rank'.")
+    return method
+
+
+def resolve_annotation_mode(annotation_mode: str = "stratified") -> str:
+    mode = str(annotation_mode).lower().strip()
+    if mode not in ANNOTATION_MODES:
+        raise ValueError("annotation_mode must be 'stratified' or 'global'.")
+    return mode
 
 
 def safe_calculate_qc_metrics(adata, verbose=False):
@@ -168,7 +192,15 @@ class SpatialSimulator:
         """Get current model parameters."""
         return self._model_params
     
-    def simulate(self, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.0, boundary_multiplier: float = 1.1, random_seed: int = None) -> ad.AnnData:
+    def simulate(
+        self,
+        num_simulation_cores: int = 12,
+        verbose: bool = True,
+        clip_overshoot_factor: float = 0.0,
+        boundary_multiplier: float = 1.1,
+        random_seed: int = None,
+        assignment_method: str = "ot",
+    ) -> ad.AnnData:
         """
         Args:
             num_simulation_cores (int): Number of cores for simulation (legacy parameter).
@@ -176,12 +208,14 @@ class SpatialSimulator:
             clip_overshoot_factor (float): Factor to clip max expression values relative to reference.
             boundary_multiplier (float): Multiplier for maximum count boundary constraint (default 1.1 = 110% of reference max).
             random_seed (int, optional): Seed for raw generative quantile decoding.
+            assignment_method (str): Spot quantile assignment engine, either "ot" or "rank".
         """
         if self._model_params is None:
             raise ValueError("Model parameters not set. Call fit_model() first or provide model_params in constructor.")
+        assignment_method = resolve_assignment_method(assignment_method)
         
         if verbose:
-            print("Generating simulated data with quantile count decoding...")
+            print(f"Generating simulated data with {assignment_method} quantile assignment...")
         
         simulated_adata = self._apply_quantile_count_decoding(
             reference_adata=self.reference_adata,
@@ -190,6 +224,7 @@ class SpatialSimulator:
             clip_overshoot_factor=clip_overshoot_factor,
             boundary_multiplier=boundary_multiplier,
             random_seed=random_seed,
+            assignment_method=assignment_method,
         )
         
         if verbose:
@@ -198,7 +233,16 @@ class SpatialSimulator:
         safe_calculate_qc_metrics(simulated_adata)
         return simulated_adata
 
-    def _apply_quantile_count_decoding(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, random_seed=None):
+    def _apply_quantile_count_decoding(
+        self,
+        reference_adata,
+        model_params,
+        verbose=True,
+        clip_overshoot_factor=0.0,
+        boundary_multiplier=1.1,
+        random_seed=None,
+        assignment_method="ot",
+    ):
         """Generate counts from model parameters through the integrated quantile decoder."""
         reference_matrix = _dense_matrix(reference_adata.X, dtype=np.float64)
         spatial_coords = reference_adata.obsm['spatial']
@@ -207,20 +251,13 @@ class SpatialSimulator:
         mode = resolve_simulation_mode(model_params.get('simulation_mode', 'empirical'))
         diagnostics_seed = model_params.get('random_seed', None)
         seed = random_seed if random_seed is not None else diagnostics_seed
-        quantile_calibration = model_params.get(
-            'quantile_calibration',
-            'reference_rank' if mode == 'empirical' else 'raw',
+        assignment_method = resolve_assignment_method(assignment_method)
+        quantile_input, assignment_diagnostics = self._build_spot_quantiles(
+            reference_matrix=reference_matrix,
+            spatial_coords=spatial_coords,
+            assignment_method=assignment_method,
         )
-
-        if quantile_calibration == 'reference_rank':
-            quantile_input = reference_matrix
-            decoder_calibration = 'rank'
-        elif quantile_calibration == 'raw':
-            rng = np.random.default_rng(None if seed is None else int(seed))
-            quantile_input = rng.random((n_spots, n_genes), dtype=np.float64)
-            decoder_calibration = 'raw'
-        else:
-            raise ValueError("quantile_calibration must be 'reference_rank' or 'raw' for integrated simulation.")
+        decoder_calibration = 'raw'
 
         simulated_matrix = decode_counts_from_quantiles(
             quantile_input,
@@ -251,6 +288,7 @@ class SpatialSimulator:
             'clip_overshoot_factor': float(clip_overshoot_factor),
             'boundary_multiplier': float(boundary_multiplier),
             'simulation_mode': mode,
+            'assignment_method': assignment_method,
             'random_seed': "none" if seed is None else int(seed),
         }
         simulated_adata.uns['simulation_diagnostics'] = _hdf5_safe_metadata(self._build_simulation_diagnostics(
@@ -258,10 +296,12 @@ class SpatialSimulator:
             simulated_matrix=simulated_matrix,
             model_params=model_params,
             simulation_mode=mode,
-            quantile_calibration=quantile_calibration,
+            quantile_calibration=decoder_calibration,
             random_seed=seed,
             boundary_clipped_gene_count=boundary_clipped_gene_count,
             clip_overshoot_factor=clip_overshoot_factor,
+            spot_assignment_method=assignment_method,
+            assignment_diagnostics=assignment_diagnostics,
         ))
         if model_params.get('parameter_diagnostics', {}).get('requested_config') is not None:
             simulated_adata.uns['alteration_diagnostics'] = _hdf5_safe_metadata({
@@ -270,6 +310,35 @@ class SpatialSimulator:
                 'realized_stage_achieved_change': simulated_adata.uns['simulation_diagnostics'].get('realized_stage_achieved_change'),
             })
         return simulated_adata
+
+    def _build_spot_quantiles(self, reference_matrix, spatial_coords, assignment_method):
+        reference_quantiles = calculate_quantiles(reference_matrix)
+        if assignment_method == "rank":
+            return reference_quantiles, {
+                "spot_assignment_method": "rank",
+                "source_spots": int(reference_quantiles.shape[0]),
+                "target_spots": int(reference_quantiles.shape[0]),
+            }
+
+        normalized_coords = normalize_coordinates(spatial_coords)
+        plan = solve_spatial_transport(
+            normalized_coords,
+            normalized_coords,
+            epsilon=0.02,
+            sinkhorn_iter=300,
+            sinkhorn_tol=1e-6,
+            unbalanced_transport=False,
+            boundary_weight=0.0,
+        )
+        transported = transport_quantiles(plan, reference_quantiles, assignment_randomness=0.0)
+        return transported, {
+            "spot_assignment_method": "ot",
+            "source_spots": int(reference_quantiles.shape[0]),
+            "target_spots": int(reference_quantiles.shape[0]),
+            "transport_mass": float(plan.sum()),
+            "epsilon": 0.02,
+            "sinkhorn_iter": 300,
+        }
 
     def _build_simulation_diagnostics(
         self,
@@ -281,6 +350,8 @@ class SpatialSimulator:
         random_seed,
         boundary_clipped_gene_count,
         clip_overshoot_factor,
+        spot_assignment_method,
+        assignment_diagnostics,
     ):
         reference_stats = _gene_stats_from_matrix(reference_matrix, self.reference_adata.var_names)
         realized_stats = _gene_stats_from_matrix(simulated_matrix, self.reference_adata.var_names)
@@ -290,13 +361,16 @@ class SpatialSimulator:
             target_change = calculate_fold_change(reference_stats, target_stats)
 
         parameter_diagnostics = model_params.get('parameter_diagnostics', {})
+        gene_assignment_method = parameter_diagnostics.get(
+            'assignment_method',
+            'identity' if simulation_mode == 'empirical' else 'copula_rank_ot',
+        )
         diagnostics = {
             'simulation_mode': simulation_mode,
             'gene_parameter_engine': parameter_diagnostics.get('gene_parameter_engine', simulation_mode),
-            'assignment_method': parameter_diagnostics.get(
-                'assignment_method',
-                'identity' if simulation_mode == 'empirical' else 'copula_rank_ot',
-            ),
+            'assignment_method': gene_assignment_method,
+            'gene_assignment_method': gene_assignment_method,
+            'spot_assignment_method': spot_assignment_method,
             'count_decode_method': 'quantile',
             'quantile_calibration': quantile_calibration,
             'random_seed': None if random_seed is None else int(random_seed),
@@ -306,6 +380,8 @@ class SpatialSimulator:
             'realized_stage_achieved_change': calculate_fold_change(reference_stats, realized_stats),
             'copula_rank_diagnostics': parameter_diagnostics.get('copula_rank_diagnostics', {}),
             'moment_feasibility': parameter_diagnostics.get('moment_feasibility', {'infeasible_gene_count': 0}),
+            'model_moment_diagnostics': model_params.get('model_moment_diagnostics', {}),
+            'spot_assignment_diagnostics': assignment_diagnostics,
             'boundary_clipping': {
                 'clip_overshoot_factor': float(clip_overshoot_factor),
                 'clipped_gene_count': int(boundary_clipped_gene_count),
@@ -779,9 +855,10 @@ class SpatialSimulator:
         return self.simulate(**kwargs)
 
     def simulate_by_annotation(self, annotation_key: str, **kwargs) -> ad.AnnData:
-        """Compatibility path for annotation-key callers."""
+        """Simulate globally or within annotation strata."""
         if annotation_key not in self.reference_adata.obs:
             raise KeyError(f"annotation_key '{annotation_key}' not found in adata.obs.")
+        annotation_mode = resolve_annotation_mode(kwargs.get("annotation_mode", "stratified"))
         fit_kwargs = {
             "visualize_fits": kwargs.get("visualize_fits", False),
             "use_real_stats_directly": kwargs.get("use_real_stats_directly", False),
@@ -795,19 +872,83 @@ class SpatialSimulator:
             "simulation_mode": kwargs.get("simulation_mode", "generative"),
             "random_seed": kwargs.get("random_seed"),
         }
-        self.fit_model(**fit_kwargs)
-        simulated = self.simulate(
-            num_simulation_cores=kwargs.get("num_simulation_cores", 12),
-            verbose=kwargs.get("verbose", True),
-            clip_overshoot_factor=kwargs.get("clip_overshoot_factor", 0.1),
-            boundary_multiplier=kwargs.get("boundary_multiplier", 1.1),
-            random_seed=kwargs.get("random_seed"),
+        simulate_kwargs = {
+            "num_simulation_cores": kwargs.get("num_simulation_cores", 12),
+            "verbose": kwargs.get("verbose", True),
+            "clip_overshoot_factor": kwargs.get("clip_overshoot_factor", 0.0),
+            "boundary_multiplier": kwargs.get("boundary_multiplier", 1.1),
+            "random_seed": kwargs.get("random_seed"),
+            "assignment_method": kwargs.get("assignment_method", "ot"),
+        }
+        if annotation_mode == "global":
+            self.fit_model(**fit_kwargs)
+            simulated = self.simulate(**simulate_kwargs)
+            simulated.uns["annotation_key"] = annotation_key
+            simulated.uns["annotation_mode"] = "global"
+            simulated.uns["annotation_diagnostics"] = {
+                "mode": "global",
+                "stratified": False,
+            }
+            return simulated
+
+        labels = self.reference_adata.obs[annotation_key].astype(str).to_numpy()
+        unique_labels = sorted(pd.unique(labels).tolist())
+        label_matrices = {}
+        label_diagnostics = {}
+        for label_idx, label in enumerate(unique_labels):
+            mask = labels == label
+            n_label_spots = int(np.sum(mask))
+            if n_label_spots < 3:
+                warnings.warn(
+                    f"annotation label '{label}' has only {n_label_spots} spots; attempting stratified fitting anyway.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            subset = self.reference_adata[mask, :].copy()
+            label_seed = None if kwargs.get("random_seed") is None else int(kwargs.get("random_seed")) + label_idx
+            label_fit_kwargs = dict(fit_kwargs)
+            label_fit_kwargs["random_seed"] = label_seed
+            label_simulate_kwargs = dict(simulate_kwargs)
+            label_simulate_kwargs["random_seed"] = label_seed
+            label_simulator = SpatialSimulator(subset)
+            label_simulator.fit_model(**label_fit_kwargs)
+            label_simulated = label_simulator.simulate(**label_simulate_kwargs)
+            label_matrices[label] = _dense_matrix(label_simulated.X, dtype=np.float32)
+            label_diagnostics[label] = {
+                "n_spots": n_label_spots,
+                "small_group_warning": bool(n_label_spots < 3),
+                "simulation_diagnostics": label_simulated.uns.get("simulation_diagnostics", {}),
+            }
+
+        simulated_matrix = np.zeros(self.reference_adata.shape, dtype=np.float32)
+        for label in unique_labels:
+            simulated_matrix[labels == label, :] = label_matrices[label]
+        simulated = ad.AnnData(
+            X=simulated_matrix,
+            obs=self.reference_adata.obs.copy(),
+            var=self.reference_adata.var.copy(),
+            obsm={'spatial': self.reference_adata.obsm['spatial'].copy()},
         )
+        simulated.uns["simulation_method"] = "Stratified_Annotation_Quantile_Count_Decoding"
         simulated.uns["annotation_key"] = annotation_key
+        simulated.uns["annotation_mode"] = "stratified"
+        simulated.uns["annotation_diagnostics"] = {
+            "mode": "stratified",
+            "stratified": True,
+            "labels": label_diagnostics,
+        }
+        simulated.uns["simulation_params"] = {
+            "clip_overshoot_factor": float(simulate_kwargs["clip_overshoot_factor"]),
+            "boundary_multiplier": float(simulate_kwargs["boundary_multiplier"]),
+            "simulation_mode": resolve_simulation_mode(fit_kwargs["simulation_mode"]),
+            "assignment_method": resolve_assignment_method(simulate_kwargs["assignment_method"]),
+            "random_seed": "none" if kwargs.get("random_seed") is None else int(kwargs.get("random_seed")),
+        }
+        safe_calculate_qc_metrics(simulated, verbose=kwargs.get("verbose", True))
         return simulated
     
 
-def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, simulation_mode: str = 'generative', random_seed: int = None) -> ad.AnnData:
+def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.0, use_real_stats_directly: bool = False, annotation_key: str = None, annotation_mode: str = 'stratified', use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, simulation_mode: str = 'generative', random_seed: int = None, assignment_method: str = 'ot') -> ad.AnnData:
     """
     Run single-slice simulation with explicit generative or empirical semantics.
     
@@ -828,9 +969,13 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
                 )
         simulation_mode: "generative" by default, or "empirical" for strict controlled alteration.
         random_seed: Optional seed for reproducible generative sampling and quantile decoding.
+        assignment_method: "ot" (default) or "rank" for spatial quantile assignment.
+        annotation_mode: "stratified" (default) or "global" when annotation_key is provided.
         Other parameters: See individual parameter documentation in fit_model() and simulate() methods.
     """
     simulation_mode = resolve_simulation_mode(simulation_mode)
+    assignment_method = resolve_assignment_method(assignment_method)
+    annotation_mode = resolve_annotation_mode(annotation_mode)
     if verbose: print("Starting comprehensive single slice simulation...")
     adata = adata.copy()
     safe_calculate_qc_metrics(adata, verbose=verbose)
@@ -849,16 +994,17 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
     }
 
     if annotation_key:
-        if use_real_stats_directly: print("Warning: `use_real_stats_directly` is not implemented for annotation-based simulation. Running standard simulation.")
         if verbose: print(f"Using annotation-based simulation with key: '{annotation_key}'")
         simulated_adata = simulator.simulate_by_annotation(
             annotation_key=annotation_key, 
+            annotation_mode=annotation_mode,
             visualize_fits=visualize_fits, 
             num_simulation_cores=num_simulation_cores, 
             verbose=verbose, 
             clip_overshoot_factor=clip_overshoot_factor, 
             boundary_multiplier=boundary_multiplier,
             alteration_config=alteration_config,
+            assignment_method=assignment_method,
             **heuristic_kwargs, # Pass all heuristic controls
         )
 
@@ -884,6 +1030,7 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
             clip_overshoot_factor=clip_overshoot_factor,
             boundary_multiplier=boundary_multiplier,
             random_seed=random_seed,
+            assignment_method=assignment_method,
         )
         
     if verbose: print(f"\nSimulation completed successfully!")

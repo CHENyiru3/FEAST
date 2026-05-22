@@ -63,7 +63,7 @@ def test_deterministic_path_with_model_params():
     assert simulated.uns["simulation_diagnostics"]["count_decode_method"] == "quantile"
 
 
-def test_public_core_api_exposes_simulation_mode_and_random_seed():
+def test_public_core_api_exposes_simulation_mode_random_seed_and_assignment_controls():
     public_callables = [
         SpatialSimulator.fit_model,
         SpatialSimulator.simulate,
@@ -74,21 +74,35 @@ def test_public_core_api_exposes_simulation_mode_and_random_seed():
     for fn in public_callables:
         params = inspect.signature(fn).parameters
         assert "random_seed" in params
+    for fn in [SpatialSimulator.simulate, simulate_single_slice, FEAST.simulate_single_slice, FEAST.simulate_alignment]:
+        assert inspect.signature(fn).parameters["assignment_method"].default == "ot"
+    for fn in [simulate_single_slice, FEAST.simulate_single_slice, FEAST.simulate_alignment]:
+        assert inspect.signature(fn).parameters["annotation_mode"].default == "stratified"
     for fn in [SpatialSimulator.fit_model, simulate_single_slice, FEAST.simulate_single_slice, FEAST.simulate_alignment]:
         assert inspect.signature(fn).parameters["simulation_mode"].default == "generative"
 
 
-def test_empirical_mode_with_model_params_uses_reference_rank_quantiles():
+def test_default_spot_assignment_is_ot_with_model_params():
     model_params = _model_params()
     model_params["simulation_mode"] = "empirical"
-    model_params["quantile_calibration"] = "reference_rank"
     simulator = SpatialSimulator(_adata(), model_params=model_params)
     simulated = simulator.simulate(verbose=False, random_seed=11)
     diagnostics = simulated.uns["simulation_diagnostics"]
     assert diagnostics["simulation_mode"] == "empirical"
-    assert diagnostics["assignment_method"] == "identity"
+    assert diagnostics["gene_assignment_method"] == "identity"
+    assert diagnostics["spot_assignment_method"] == "ot"
     assert diagnostics["count_decode_method"] == "quantile"
-    assert diagnostics["quantile_calibration"] == "reference_rank"
+
+
+def test_rank_spot_assignment_can_be_requested():
+    model_params = _model_params()
+    model_params["simulation_mode"] = "empirical"
+    simulator = SpatialSimulator(_adata(), model_params=model_params)
+    simulated = simulator.simulate(verbose=False, random_seed=11, assignment_method="rank")
+    diagnostics = simulated.uns["simulation_diagnostics"]
+    assert diagnostics["gene_assignment_method"] == "identity"
+    assert diagnostics["spot_assignment_method"] == "rank"
+    assert simulated.uns["simulation_params"]["assignment_method"] == "rank"
 
 
 def test_public_empirical_single_slice_smoke():
@@ -103,6 +117,31 @@ def test_public_empirical_single_slice_smoke():
     diagnostics = simulated.uns["simulation_diagnostics"]
     assert simulated.shape == (3, 2)
     assert diagnostics["simulation_mode"] == "empirical"
-    assert diagnostics["assignment_method"] == "identity"
+    assert diagnostics["gene_assignment_method"] == "identity"
+    assert diagnostics["spot_assignment_method"] == "ot"
     assert diagnostics["count_decode_method"] == "quantile"
     assert diagnostics["target_stage_achieved_change"]["mean"] == pytest.approx(0.8)
+
+
+def test_invalid_spot_assignment_method_rejected():
+    simulator = SpatialSimulator(_adata(), model_params=_model_params())
+    with pytest.raises(ValueError, match="assignment_method"):
+        simulator.simulate(verbose=False, assignment_method="random")
+
+
+def test_annotation_key_defaults_to_stratified_mode():
+    adata = _adata()
+    adata.obs["cell_type"] = ["a", "a", "b"]
+    simulated = simulate_single_slice(
+        adata,
+        annotation_key="cell_type",
+        simulation_mode="empirical",
+        assignment_method="rank",
+        random_seed=3,
+        verbose=False,
+        clip_overshoot_factor=0.0,
+    )
+    assert simulated.shape == adata.shape
+    assert simulated.uns["annotation_key"] == "cell_type"
+    assert simulated.uns["annotation_mode"] == "stratified"
+    assert set(simulated.uns["annotation_diagnostics"]["labels"]) == {"a", "b"}

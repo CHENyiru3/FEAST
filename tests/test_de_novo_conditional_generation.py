@@ -5,6 +5,7 @@ import anndata as ad
 from FEAST.de_novo import (
     SimulationBlueprintBuilder,
     ReferenceFitConfig,
+    SimulationConfig,
     fit_reference,
     simulate_from_reference,
 )
@@ -37,7 +38,12 @@ def test_conditional_reference_generation_smoke():
     )
     blueprint = SimulationBlueprintBuilder.rectangular_grid(2, 2).set_domains(["a", "a", "b", "b"]).build()
 
-    result = simulate_from_reference(model, blueprint, random_seed=5)
+    result = simulate_from_reference(
+        model,
+        blueprint,
+        config=SimulationConfig(boundary_multiplier=1.0),
+        random_seed=5,
+    )
 
     assert result.shape == (4, 3)
     assert list(result.var_names) == ["g1", "g2", "g3"]
@@ -46,5 +52,7 @@ def test_conditional_reference_generation_smoke():
     assert "transported_quantiles" in result.layers
     assert np.issubdtype(result.X.dtype, np.integer)
     assert np.all(result.X >= 0)
+    reference_max = np.asarray([_reference("r1").X, _reference("r2").X]).max(axis=(0, 1))
+    assert np.all(np.asarray(result.X).max(axis=0) <= reference_max)
     assert result.uns["de_novo"]["conditional_generation"] is True
     assert set(result.uns["de_novo"]["transport_weights"]) == {"a", "b"}

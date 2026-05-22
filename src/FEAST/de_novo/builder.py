@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from ..FEAST_core.count_decoding import decode_counts_from_quantiles, resolve_decode_method
+from ..FEAST_core.count_modeling import stats_frame_to_model_params
 from .conditional import VirtualSliceGenerationConfig
 from .core import SliceBlueprint, active_mask_metadata, assign_generated_coordinates, load_blueprint
 from .pattern import compose_gene_pattern, diffuse_quantile_map
@@ -110,25 +111,7 @@ def _resolve_parameter_cloud_for_label(
 
 
 def _stats_frame_to_model_params(stats: pd.DataFrame) -> dict:
-    model_selected = []
-    marginal_param1 = []
-    for _, row in stats.iterrows():
-        mean = max(float(row["mean"]), 1e-8)
-        variance = max(float(row["variance"]), 1e-8)
-        pi0 = float(np.clip(row["zero_prop"], 0.0, 0.99))
-        active_mean = max(mean / max(1.0 - pi0, 1e-8), 1e-8)
-        if variance > active_mean + 1e-8:
-            r = max(active_mean * active_mean / max(variance - active_mean, 1e-8), 1e-6)
-            model_selected.append("ZINB" if pi0 > 1e-8 else "NB")
-            marginal_param1.append([pi0, r, active_mean])
-        else:
-            model_selected.append("ZIP" if pi0 > 1e-8 else "Poisson")
-            marginal_param1.append([pi0, 1.0, active_mean])
-    return {
-        "genes": list(stats.index.astype(str)),
-        "model_selected": model_selected,
-        "marginal_param1": marginal_param1,
-    }
+    return stats_frame_to_model_params(stats)
 
 
 def _ensure_design_blueprint(

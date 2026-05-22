@@ -7,12 +7,16 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import anndata as ad
 import numpy as np
 import pandas as pd
-import torch
 from sklearn.neighbors import NearestNeighbors
 
 from ..FEAST_core.count_decoding import decode_counts_from_quantiles, resolve_decode_method
+from ..FEAST_core.count_modeling import stats_frame_to_model_params
+from ..FEAST_core.spatial_assignment import (
+    calculate_quantiles,
+    solve_spatial_transport,
+    transport_quantiles,
+)
 from ._metadata import records_by_label_to_h5ad_uns
-from ._transport import log_sinkhorn
 from .core import SliceBlueprint, active_mask_metadata, assign_generated_coordinates, load_blueprint
 from .pattern import diffuse_quantile_map
 
@@ -285,12 +289,19 @@ def generate_virtual_slice(
             )
         else:
             model_params = _stats_frame_to_model_params(label_clouds[label])
+            reference_X = _reference_counts_for_label(
+                label=label,
+                label_key=model.label_key,
+                gene_names=model.gene_names,
+                eligible_refs=eligible_refs,
+            )
             decoded = decode_counts_from_quantiles(
                 label_q,
                 model_params,
                 method=decode_method,
                 quantile_calibration=str(gen_cfg.quantile_calibration),
                 boundary_multiplier=float(gen_cfg.boundary_multiplier),
+                reference_X=reference_X,
                 random_seed=int(random_seed),
                 show_progress=bool(gen_cfg.verbose),
             )
@@ -442,25 +453,7 @@ def _stats_dataframe(matrix: np.ndarray, gene_names: Sequence[str]) -> pd.DataFr
 
 
 def _calculate_quantiles(matrix: np.ndarray) -> np.ndarray:
-    matrix = np.asarray(matrix, dtype=np.float64)
-    n, p = matrix.shape
-    if n == 0:
-        return np.zeros((0, p), dtype=np.float32)
-    if n == 1:
-        return np.full((1, p), 0.5, dtype=np.float32)
-    ranks = np.zeros((n, p), dtype=np.float64)
-    for j in range(p):
-        order = np.argsort(matrix[:, j], kind="mergesort")
-        values = matrix[order, j]
-        start = 0
-        while start < n:
-            end = start + 1
-            while end < n and values[end] == values[start]:
-                end += 1
-            avg_rank = 0.5 * (start + end - 1)
-            ranks[order[start:end], j] = avg_rank
-            start = end
-    return (ranks / float(n - 1)).astype(np.float32, copy=False)
+    return calculate_quantiles(matrix)
 
 
 def _normalize_label_coordinates(coords: np.ndarray) -> np.ndarray:
@@ -605,54 +598,25 @@ def _solve_label_transport(
     target_boundary: np.ndarray,
     config: VirtualSliceGenerationConfig,
 ) -> np.ndarray:
-    source_coords = np.asarray(source_coords, dtype=np.float32)
-    target_coords = np.asarray(target_coords, dtype=np.float32)
-    if source_coords.shape[0] == 0 or target_coords.shape[0] == 0:
-        return np.zeros((source_coords.shape[0], target_coords.shape[0]), dtype=np.float32)
-
-    source_boundary = np.asarray(source_boundary, dtype=np.float32).reshape(-1, 1)
-    target_boundary = np.asarray(target_boundary, dtype=np.float32).reshape(1, -1)
-    source_sq = np.sum(source_coords**2, axis=1, keepdims=True)
-    target_sq = np.sum(target_coords**2, axis=1, keepdims=True).T
-    dist2 = np.maximum(source_sq + target_sq - 2.0 * source_coords @ target_coords.T, 0.0)
-    boundary_cost = np.abs(source_boundary - target_boundary)
-    cost = float(config.geometry_weight) * dist2 + float(config.boundary_weight) * boundary_cost
-    a = np.full(source_coords.shape[0], 1.0 / source_coords.shape[0], dtype=np.float32)
-    b = np.full(target_coords.shape[0], 1.0 / target_coords.shape[0], dtype=np.float32)
-
-    dtype = torch.float64 if str(config.torch_dtype).lower() == "float64" else torch.float32
-    device = torch.device(str(config.torch_device))
-    plan = log_sinkhorn(
-        C=torch.as_tensor(cost, dtype=dtype, device=device),
-        a=torch.as_tensor(a, dtype=dtype, device=device),
-        b=torch.as_tensor(b, dtype=dtype, device=device),
+    return solve_spatial_transport(
+        source_coords,
+        target_coords,
+        source_boundary=source_boundary,
+        target_boundary=target_boundary,
+        geometry_weight=float(config.geometry_weight),
+        boundary_weight=float(config.boundary_weight),
         epsilon=float(config.epsilon),
-        n_iter=int(config.sinkhorn_iter),
-        tol=float(config.sinkhorn_tol),
-        unbalanced=bool(config.unbalanced_transport),
+        sinkhorn_iter=int(config.sinkhorn_iter),
+        sinkhorn_tol=float(config.sinkhorn_tol),
+        unbalanced_transport=bool(config.unbalanced_transport),
         reg_m=float(config.reg_m),
+        torch_device=str(config.torch_device),
+        torch_dtype=str(config.torch_dtype),
     )
-    return plan.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
 def _transport_quantiles(plan: np.ndarray, quantiles: np.ndarray, assignment_randomness: float) -> np.ndarray:
-    plan = np.asarray(plan, dtype=np.float64)
-    quantiles = np.asarray(quantiles, dtype=np.float64)
-    if plan.shape[0] != quantiles.shape[0]:
-        raise ValueError("transport plan source dimension does not match source quantiles.")
-    if plan.shape[1] == 0:
-        return np.zeros((0, quantiles.shape[1]), dtype=np.float32)
-
-    column_mass = plan.sum(axis=0, keepdims=True)
-    safe_mass = np.where(column_mass > 1e-12, column_mass, 1.0)
-    weights = plan / safe_mass
-    transported = weights.T @ quantiles
-
-    randomness = float(np.clip(assignment_randomness, 0.0, 1.0))
-    if randomness > 0 and quantiles.shape[0] > 0:
-        sampled = quantiles[np.random.randint(0, quantiles.shape[0], size=plan.shape[1]), :]
-        transported = (1.0 - randomness) * transported + randomness * sampled
-    return np.clip(transported, 0.0, 1.0).astype(np.float32, copy=False)
+    return transport_quantiles(plan, quantiles, assignment_randomness)
 
 
 def _decode_label_aware_rank_counts(
@@ -723,6 +687,34 @@ def _decode_label_aware_rank_counts(
         counts[:, gene_idx] = np.rint(values[selected]).astype(np.int32)
 
     return counts
+
+
+def _reference_counts_for_label(
+    label: str,
+    label_key: str,
+    gene_names: Sequence[str],
+    eligible_refs: Sequence[ReferenceSliceData],
+) -> Optional[np.ndarray]:
+    matrices = []
+    for ref in eligible_refs:
+        adata = ref.adata
+        labels = adata.obs[label_key].astype(str).to_numpy()
+        mask = labels == str(label)
+        if not np.any(mask):
+            continue
+        gene_indices = []
+        for gene_name in gene_names:
+            try:
+                gene_indices.append(int(adata.var_names.get_loc(str(gene_name))))
+            except KeyError:
+                gene_indices.append(None)
+        if any(idx is None for idx in gene_indices):
+            continue
+        matrix = _counts_matrix(adata)[mask, :][:, gene_indices]
+        matrices.append(np.asarray(matrix, dtype=np.float64))
+    if not matrices:
+        return None
+    return np.vstack(matrices)
 
 
 def _resolve_parameter_cloud(
@@ -833,22 +825,4 @@ def _looks_like_stats_mapping(payload: Mapping[str, Any]) -> bool:
 
 
 def _stats_frame_to_model_params(stats: pd.DataFrame) -> dict:
-    model_selected = []
-    marginal_param1 = []
-    for _, row in stats.iterrows():
-        mean = max(float(row["mean"]), 1e-8)
-        variance = max(float(row["variance"]), 1e-8)
-        pi0 = float(np.clip(row["zero_prop"], 0.0, 0.99))
-        active_mean = max(mean / max(1.0 - pi0, 1e-8), 1e-8)
-        if variance > active_mean + 1e-8:
-            r = max(active_mean * active_mean / max(variance - active_mean, 1e-8), 1e-6)
-            model_selected.append("ZINB" if pi0 > 1e-8 else "NB")
-            marginal_param1.append([pi0, r, active_mean])
-        else:
-            model_selected.append("ZIP" if pi0 > 1e-8 else "Poisson")
-            marginal_param1.append([pi0, 1.0, active_mean])
-    return {
-        "genes": list(stats.index.astype(str)),
-        "model_selected": model_selected,
-        "marginal_param1": marginal_param1,
-    }
+    return stats_frame_to_model_params(stats)

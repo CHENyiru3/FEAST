@@ -19,6 +19,7 @@ from scipy.spatial.distance import cdist
 from sklearn.preprocessing import StandardScaler
 
 import pyvinecopulib as pv
+from .count_modeling import stats_frame_to_model_params
 from ..modeling.StudentT_mixture_model import StudentTMixtureMarginalModeler
 from ..modeling.Beta_mixture_model import BetaMixtureMarginalModeler
 from ..modeling.marginal_alteration import alter_marginal_model, AlterationConfig
@@ -678,62 +679,12 @@ def convert_params_for_new_simulator(stats_df: pd.DataFrame):
     parameters for specific count models (ZINB, etc.) using the improved
     log-scale moment inference method.
     """
-    if 'gene_id' in stats_df.columns:
-        stats_df = stats_df.set_index('gene_id')
-    stats_df = stats_df[STAT_COLUMNS].copy()
-    print(f"\n--- [CONVERTING] Converting {len(stats_df)} parameter sets via log-scale moment-matching ---")
-    
-    output_dict = {'genes': {}, 'model_selected': [], 'marginal_param1': []}
-    
-    # Debug: track model selection distribution
-    model_counts = {}
-    debug_stats = []
-    
-    for i, (gene_id, record) in enumerate(stats_df.iterrows()):
-        record_dict = record.to_dict()
-        mu = record_dict['mean']
-        var = record_dict['variance']
-        zp = record_dict['zero_prop']
-        
-        # Debug: collect stats for analysis
-        overdispersion = var / mu if mu > 1e-8 else 0
-        debug_stats.append({
-            'gene': gene_id,
-            'mean': mu,
-            'variance': var,
-            'zero_prop': zp,
-            'overdispersion': overdispersion,
-            'is_zero_inflated': zp > 0.3,
-            'is_overdispersed': overdispersion > 2.0
-        })
-        
-        # Select the best model and estimate its parameters using the new methods
-        model_type = _select_model_with_heuristic(mu, var, zp)
-        params = _estimate_params_no_fallback(model_type, mu, var, zp)
-        
-        model_counts[model_type] = model_counts.get(model_type, 0) + 1
-        
-        pi0, r, mean_param = 0.0, np.inf, 0.0
-        if model_type == 'Poisson':
-            mean_param = params.get('lambda', 1e-8)
-        elif model_type == 'NB':
-            mean_param, r = params.get('mu', 1e-8), params.get('r', np.inf)
-        elif model_type == 'ZIP':
-            pi0, mean_param = params.get('pi0', 0.0), params.get('lambda', 1e-8)
-        elif model_type == 'ZINB':
-            pi0, mean_param, r = params.get('pi0', 0.0), params.get('mu', 1e-8), params.get('r', np.inf)
-        
-        output_dict['genes'][i] = gene_id
-        output_dict['model_selected'].append(model_type)
-        output_dict['marginal_param1'].append([pi0, r, mean_param])
-    
-    # Debug output
-    debug_df = pd.DataFrame(debug_stats)
-    print(f"  > Model selection summary: {model_counts}")
-    print(f"  > Zero inflation rate: {debug_df['is_zero_inflated'].mean():.2%}")
-    print(f"  > Overdispersion rate: {debug_df['is_overdispersed'].mean():.2%}")
-    print(f"  > Mean overdispersion: {debug_df['overdispersion'].mean():.2f}")
-    print(f"  > Mean zero proportion: {debug_df['zero_prop'].mean():.3f}")
-        
+    n_params = len(stats_df)
+    print(f"\n--- [CONVERTING] Converting {n_params} parameter sets via shared moment-matching ---")
+    output_dict = stats_frame_to_model_params(stats_df)
+    diagnostics = output_dict.get('model_moment_diagnostics', {})
+    print(f"  > Model selection summary: {diagnostics.get('model_selection_counts', {})}")
+    print(f"  > Mean log moment error: {diagnostics.get('mean_log_moment_error', 0.0):.6f}")
+    print(f"  > Max log moment error: {diagnostics.get('max_log_moment_error', 0.0):.6f}")
     print("✓ Conversion complete.")
     return output_dict
