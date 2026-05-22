@@ -69,8 +69,6 @@ class FEAST:
 
     def simulate_single_slice(
         self,
-        sigma: Optional[float] = 0,
-        follower_sigma_factor: float = 0,
         visualize_fits: bool = False,
         num_simulation_cores: int = 12,
         verbose: Optional[bool] = None,
@@ -85,14 +83,13 @@ class FEAST:
         n_jobs: int = -1,
         alteration_config: Optional[Any] = None,
         boundary_multiplier: float = 1.1,
-        **kwargs,
+        simulation_mode: str = "generative",
+        random_seed: Optional[int] = None,
     ) -> ad.AnnData:
         if verbose is None:
             verbose = self.verbose
         return simulate_single_slice(
             self._single_adata("Single slice simulation"),
-            sigma=sigma,
-            follower_sigma_factor=follower_sigma_factor,
             visualize_fits=visualize_fits,
             num_simulation_cores=num_simulation_cores,
             verbose=verbose,
@@ -107,7 +104,8 @@ class FEAST:
             n_jobs=n_jobs,
             alteration_config=alteration_config,
             boundary_multiplier=boundary_multiplier,
-            **kwargs,
+            simulation_mode=simulation_mode,
+            random_seed=random_seed,
         )
 
     def simulate_alignment(
@@ -118,10 +116,15 @@ class FEAST:
         data_type: str = "imaging",
         filter_edge_spots: bool = True,
         edge_margin_ratio: float = 0.03,
+        center_correction: Any = 0,
+        keep_bounds: bool = True,
+        min_space: Optional[float] = None,
+        max_grid_size: int = 10000,
+        grid_size: int = 3,
+        alpha: float = 1.0,
+        apply_rotation: bool = True,
         fit_params: Optional[Dict] = None,
         expression_params: Optional[Dict] = None,
-        sigma: Optional[float] = 0,
-        follower_sigma_factor: float = 0,
         visualize_fits: bool = False,
         num_simulation_cores: int = 12,
         clip_overshoot_factor: float = 0.1,
@@ -135,15 +138,14 @@ class FEAST:
         n_jobs: int = -1,
         alteration_config: Optional[Any] = None,
         boundary_multiplier: float = 1.1,
+        simulation_mode: str = "generative",
+        random_seed: Optional[int] = None,
         verbose: Optional[bool] = None,
-        **kwargs,
     ) -> tuple:
         if verbose is None:
             verbose = self.verbose
         adata_to_use = self._single_adata("Alignment simulation")
         simulation_params = {
-            "sigma": sigma,
-            "follower_sigma_factor": follower_sigma_factor,
             "visualize_fits": visualize_fits,
             "num_simulation_cores": num_simulation_cores,
             "clip_overshoot_factor": clip_overshoot_factor,
@@ -157,6 +159,8 @@ class FEAST:
             "n_jobs": n_jobs,
             "alteration_config": alteration_config,
             "boundary_multiplier": boundary_multiplier,
+            "simulation_mode": simulation_mode,
+            "random_seed": random_seed,
             "verbose": verbose,
         }
         if fit_params:
@@ -173,7 +177,10 @@ class FEAST:
                 edge_margin_ratio=edge_margin_ratio,
                 fit_params=simulation_params,
                 expression_params={},
-                **kwargs,
+                center_correction=center_correction,
+                keep_bounds=keep_bounds,
+                min_space=min_space,
+                max_grid_size=max_grid_size,
             )
         if transformation_type == "warp":
             return simulate_alignment_warp(
@@ -183,7 +190,9 @@ class FEAST:
                 edge_margin_ratio=edge_margin_ratio,
                 fit_params=simulation_params,
                 expression_params={},
-                **kwargs,
+                grid_size=grid_size,
+                alpha=alpha,
+                apply_rotation=apply_rotation,
             )
         raise ValueError(f"Unsupported transformation type: {transformation_type}")
 
