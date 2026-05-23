@@ -138,8 +138,19 @@ quantiles = virtual_slice.layers["feast_quantiles"]
 
 De novo generation builds a latent rank-score field from shared spatial motifs,
 rank-normalizes that field into `feast_quantiles`, and decodes counts with the
-target parameter cloud. Reference-conditioned virtual slices use the same
-latent H-to-Q path after transporting reference rank evidence.
+target parameter cloud. Reference-conditioned virtual slices use
+OT-registered latent-field posterior inference: transported reference rank
+evidence is treated as noisy evidence for the target H field, with observation
+variance derived from transport cost, transport dispersion, and available
+z-distance before H is rank-normalized into Q.
+
+```python
+config = de_novo.SimulationConfig(
+    posterior_lambda_s=0.1,  # optional target-scaffold graph smoothing
+    target_parameter_mode="depth_gp_log",  # optional P* inference over z
+    store_latent_scores=True,
+)
+```
 
 ##  Tutorials
 

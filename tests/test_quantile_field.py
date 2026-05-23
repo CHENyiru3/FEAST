@@ -16,7 +16,9 @@ from FEAST.de_novo import (
 )
 from FEAST.de_novo.quantile_field import (
     build_spatial_program_matrix,
+    infer_latent_posterior,
     midpoint_rank_normalize,
+    posterior_observation_variance,
     rank_normalize_by_scope,
 )
 
@@ -141,7 +143,11 @@ def test_reference_generation_defaults_to_latent_reference_mode():
 
     qf = result.uns["de_novo"]["quantile_field"]
     assert qf["mode"] == "latent_reference"
-    assert qf["source"] == "reference_transport"
+    assert qf["method_version"] == "posterior_latent_field_v1"
+    assert qf["source"] == "ot_registered_posterior"
+    assert "posterior_observation_model" in qf
+    assert "posterior_prior" in qf
+    assert qf["labels"]["a"]["posterior"]["n_references"] == 2
     assert "legacy_quantile_averaging_used" not in qf
     assert "feast_quantiles" in result.layers
     assert "transported_quantiles" not in result.layers
@@ -199,6 +205,92 @@ def test_stack_records_latent_quantile_field_and_target_parameter_mode():
 
     qf = result.uns["de_novo"]["quantile_field"]
     assert qf["mode"] == "latent_reference"
+    assert qf["method_version"] == "posterior_latent_field_v1"
     assert qf["target_parameter_mode"] == "reference_weighted_log"
     assert "legacy_quantile_averaging_used" not in qf
     assert result.uns["de_novo"]["stack"]["target_z"] == 0.5
+    assert result.uns["de_novo"]["stack"]["tau_role"] == "bracketing_provenance"
+
+
+def test_stack_accepts_depth_gp_parameter_mode():
+    refs = [_reference("r1", True), _reference("r2", False)]
+    target_bp = SimulationBlueprintBuilder.rectangular_grid(2, 2).set_domains(["a"] * 4).build()
+
+    result = simulate_stack(
+        refs,
+        reference_z_values=[0.0, 1.0],
+        target_z_values=[0.5],
+        target_blueprints={0.5: target_bp},
+        config=SimulationConfig(target_parameter_mode="depth_gp_log"),
+        random_seed=2,
+    )[0.5]
+
+    qf = result.uns["de_novo"]["quantile_field"]
+    assert qf["target_parameter_mode"] == "depth_gp_log"
+    assert qf["parameter_gp"]["length_scale"] == 1.0
+    assert qf["parameter_gp"]["depth_available"] is True
+    assert np.all(result.var["target_mean"].to_numpy(dtype=float) > 0)
+
+
+def test_latent_posterior_reduces_to_precision_weighted_mean():
+    y0 = np.array([[0.0], [2.0]], dtype=np.float32)
+    y1 = np.array([[2.0], [4.0]], dtype=np.float32)
+    h, meta = infer_latent_posterior(
+        [y0, y1],
+        [
+            np.full(2, 1.0, dtype=np.float32),
+            np.full(2, 3.0, dtype=np.float32),
+        ],
+    )
+
+    expected = (y0 / 1.0 + y1 / 3.0) / (1.0 + 1.0 / 3.0)
+    np.testing.assert_allclose(h, expected, rtol=1e-6, atol=1e-6)
+    assert meta["n_references"] == 2
+    assert meta["graph"]["enabled"] is False
+
+
+def test_latent_posterior_graph_smoothing_reduces_roughness():
+    coords = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0]], dtype=np.float32)
+    y = np.array([[0.0], [10.0], [0.0]], dtype=np.float32)
+
+    unsmoothed, _ = infer_latent_posterior([y], [np.ones(3, dtype=np.float32)], coordinates=coords)
+    smoothed, meta = infer_latent_posterior(
+        [y],
+        [np.ones(3, dtype=np.float32)],
+        coordinates=coords,
+        lambda_s=1.0,
+        graph_neighbors=1,
+    )
+
+    rough_unsmoothed = float(np.sum(np.diff(unsmoothed[:, 0]) ** 2))
+    rough_smoothed = float(np.sum(np.diff(smoothed[:, 0]) ** 2))
+    assert rough_smoothed < rough_unsmoothed
+    assert meta["graph"]["enabled"] is True
+    assert meta["graph"]["n_edges"] > 0
+
+
+def test_latent_posterior_without_references_returns_prior_mean():
+    prior = np.array([[0.0, 1.0], [2.0, 3.0]], dtype=np.float32)
+
+    h, meta = infer_latent_posterior([], [], prior_mean=prior)
+
+    np.testing.assert_allclose(h, prior)
+    assert meta["prior_mean_used"] is True
+    assert meta["effective_lambda0"] == 1.0
+
+
+def test_observation_variance_uses_z_cost_and_transport_dispersion():
+    variance, meta = posterior_observation_variance(
+        target_coords=np.array([[0.0, 0.0, 2.0], [1.0, 0.0, 3.0]], dtype=np.float32),
+        reference_coords=np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]], dtype=np.float32),
+        transport_cost=np.array([0.5, 0.25], dtype=np.float32),
+        transport_variance=np.array([0.1, 0.2], dtype=np.float32),
+        sigma0=0.1,
+        alpha_z=1.0,
+        alpha_cost=2.0,
+        alpha_transport=3.0,
+    )
+
+    assert variance[1] > variance[0]
+    assert meta["z_distance_mean"] == 1.5
+    assert meta["transport_cost_mean"] == 0.375
