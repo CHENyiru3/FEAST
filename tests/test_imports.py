@@ -50,6 +50,7 @@ def test_de_novo_public_api_imports():
         "ReferenceFitConfig",
         "SimulationReference",
         "SimulationConfig",
+        "QuantileFieldConfig",
         "compose_pattern",
         "evaluate_motif",
         "fit_reference",
@@ -70,6 +71,7 @@ def test_de_novo_public_api_imports():
         SimulationBlueprint,
         SimulationPatternBuilder,
         SimulationConfig,
+        QuantileFieldConfig,
         compose_pattern,
         evaluate_motif,
         fit_reference,
@@ -89,6 +91,7 @@ def test_de_novo_public_api_imports():
     assert ReferenceFitConfig is not None
     assert SimulationReference is not None
     assert SimulationConfig is not None
+    assert QuantileFieldConfig is not None
     assert compose_pattern is not None
     assert evaluate_motif is not None
     assert fit_reference is not None
@@ -121,3 +124,43 @@ def test_de_novo_old_api_names_not_public():
     ]
     for name in old_names:
         assert not hasattr(de_novo, name)
+
+
+def test_de_novo_old_implementation_names_removed():
+    builder = importlib.import_module("FEAST.de_novo.builder")
+    conditional = importlib.import_module("FEAST.de_novo.conditional")
+    pattern = importlib.import_module("FEAST.de_novo.pattern")
+
+    assert hasattr(builder, "SimulationBlueprintBuilder")
+    assert hasattr(builder, "SimulationParameterBuilder")
+    assert hasattr(builder, "simulate_from_design")
+    for name in ["BlueprintBuilder", "ParameterCloudBuilder", "generate_virtual_slice_from_design"]:
+        assert not hasattr(builder, name)
+
+    assert hasattr(conditional, "ReferenceFitConfig")
+    assert hasattr(conditional, "SimulationReference")
+    assert hasattr(conditional, "SimulationConfig")
+    assert hasattr(conditional, "fit_reference")
+    assert hasattr(conditional, "simulate_from_reference")
+    for name in [
+        "ConditionalReferenceConfig",
+        "ConditionalReferenceModel",
+        "VirtualSliceGenerationConfig",
+        "fit_virtual_slice_reference",
+        "generate_virtual_slice",
+    ]:
+        assert not hasattr(conditional, name)
+
+    assert hasattr(pattern, "SimulationPatternBuilder")
+    assert hasattr(pattern, "compose_pattern")
+    assert hasattr(pattern, "evaluate_motif")
+    assert hasattr(pattern, "plot_pattern")
+    for name in ["SpatialPatternBuilder", "compose_gene_pattern", "evaluate_spatial_motif", "plot_gene_pattern"]:
+        assert not hasattr(pattern, name)
+
+
+def test_removed_private_api_helpers_are_absent():
+    from FEAST.FEAST_core.APIs import FEAST
+
+    for name in ["_get_core_simulator", "_get_alignment_simulator", "_get_deconvolution_simulator"]:
+        assert not hasattr(FEAST, name)

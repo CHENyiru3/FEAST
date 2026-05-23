@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 
 import anndata as ad
 import numpy as np
@@ -15,10 +15,22 @@ from ._metadata import records_by_label_to_h5ad_uns
 from ._transport import log_sinkhorn
 from .core import SliceBlueprint, active_mask_metadata, assign_generated_coordinates, load_blueprint
 from .pattern import diffuse_quantile_map
+from .quantile_field import (
+    combine_weighted_arrays,
+    quantiles_to_normal_scores,
+    rank_normalize_by_scope,
+    reference_conflict_score,
+    resolve_auto_rank_scope,
+    should_store_quantiles,
+    transport_latent_scores,
+    validate_quantile_field_config,
+    weighted_stats_log_space,
+    QuantileFieldConfig,
+)
 
 
 @dataclass
-class ConditionalReferenceConfig:
+class ReferenceFitConfig:
     min_gene_spots: int = 20
     min_gene_mean: float = 0.1
     max_gene_zero_prop: float = 0.98
@@ -27,7 +39,7 @@ class ConditionalReferenceConfig:
 
 
 @dataclass
-class VirtualSliceGenerationConfig:
+class SimulationConfig:
     epsilon: float = 0.05
     sinkhorn_iter: int = 200
     sinkhorn_tol: float = 1e-5
@@ -46,6 +58,41 @@ class VirtualSliceGenerationConfig:
     assignment_randomness: float = 0.0
     coordinate_scale: Optional[Sequence[float]] = None
     verbose: bool = False
+    quantile_field_mode: str = "auto"
+    rank_scope: str = "auto"
+    target_parameter_mode: str = "reference_weighted_log"
+    tie_policy: str = "stable_ordinal"
+    latent_clip_eps: float = 1e-6
+    tie_jitter_scale: float = 1e-9
+    min_rank_scope_size: int = 20
+    gene_chunk_size: int = 512
+    store_latent_scores: bool = False
+    store_quantiles: Any = "auto"
+    max_stored_quantile_elements: int = 50_000_000
+    reference_conflict_policy: str = "average"
+    program_noise_scale: float = 0.0
+    program_normalization: str = "zscore"
+
+
+def _quantile_field_config(config: SimulationConfig) -> QuantileFieldConfig:
+    return validate_quantile_field_config(
+        QuantileFieldConfig(
+            mode=str(config.quantile_field_mode),
+            rank_scope=str(config.rank_scope),
+            target_parameter_mode=str(config.target_parameter_mode),
+            tie_policy=str(config.tie_policy),
+            latent_clip_eps=float(config.latent_clip_eps),
+            tie_jitter_scale=float(config.tie_jitter_scale),
+            min_rank_scope_size=int(config.min_rank_scope_size),
+            gene_chunk_size=int(config.gene_chunk_size),
+            store_latent_scores=bool(config.store_latent_scores),
+            store_quantiles=config.store_quantiles,
+            max_stored_quantile_elements=int(config.max_stored_quantile_elements),
+            reference_conflict_policy=str(config.reference_conflict_policy),
+            program_noise_scale=float(config.program_noise_scale),
+            program_normalization=str(config.program_normalization),
+        )
+    )
 
 
 @dataclass
@@ -66,21 +113,21 @@ class ReferenceSliceData:
 
 
 @dataclass
-class ConditionalReferenceModel:
+class SimulationReference:
     gene_names: List[str]
     label_key: str
     references: List[ReferenceSliceData]
     coordinate_dim: int
-    fit_config: ConditionalReferenceConfig = field(default_factory=ConditionalReferenceConfig)
+    fit_config: ReferenceFitConfig = field(default_factory=ReferenceFitConfig)
     reference_metadata: Dict[str, Any] = field(default_factory=dict)
 
 
-def fit_virtual_slice_reference(
+def fit_reference(
     reference_slices: Union[ad.AnnData, Sequence[ad.AnnData]],
     label_key: str,
-    config: Optional[ConditionalReferenceConfig] = None,
-) -> ConditionalReferenceModel:
-    fit_cfg = config or ConditionalReferenceConfig()
+    config: Optional[ReferenceFitConfig] = None,
+) -> SimulationReference:
+    fit_cfg = config or ReferenceFitConfig()
     slices = _normalize_reference_slices(reference_slices)
     common_genes = _common_gene_names(slices)
     if not common_genes:
@@ -133,7 +180,7 @@ def fit_virtual_slice_reference(
             )
         )
 
-    return ConditionalReferenceModel(
+    return SimulationReference(
         gene_names=list(filtered_genes),
         label_key=label_key,
         references=references,
@@ -149,15 +196,25 @@ def fit_virtual_slice_reference(
     )
 
 
-def generate_virtual_slice(
-    model: ConditionalReferenceModel,
+def simulate_from_reference(
+    model: SimulationReference,
     target_blueprint: Union[SliceBlueprint, ad.AnnData, Mapping[str, Any], str, Path],
     parameter_cloud: Optional[Union[pd.DataFrame, Mapping[str, Any]]] = None,
-    config: Optional[VirtualSliceGenerationConfig] = None,
+    config: Optional[SimulationConfig] = None,
     random_seed: int = 0,
     reference_weights: Optional[Mapping[str, float]] = None,
 ) -> ad.AnnData:
-    gen_cfg = config or VirtualSliceGenerationConfig()
+    gen_cfg = config or SimulationConfig()
+    q_cfg = _quantile_field_config(gen_cfg)
+    if q_cfg.mode == "auto":
+        quantile_field_mode = "latent_reference"
+    elif q_cfg.mode == "latent_reference":
+        quantile_field_mode = q_cfg.mode
+    else:
+        raise ValueError(
+            "Reference-conditioned generation supports quantile_field_mode "
+            "'auto' or 'latent_reference'."
+        )
     original_blueprint = _load_target_blueprint(target_blueprint, label_key=model.label_key)
     mask_metadata = active_mask_metadata(original_blueprint)
     blueprint = original_blueprint.active_subset()
@@ -184,6 +241,9 @@ def generate_virtual_slice(
     label_cloud_out: Dict[str, Dict[str, Any]] = {}
     label_clouds: Dict[str, pd.DataFrame] = {}
     transport_diagnostics: Dict[str, List[Dict[str, Any]]] = {}
+    quantile_field_labels: Dict[str, Dict[str, Any]] = {}
+    combined_latent_scores = np.zeros((n_spots, n_genes), dtype=np.float32)
+    latent_scores_store = np.zeros((n_spots, n_genes), dtype=np.float32) if q_cfg.store_latent_scores else None
 
     unique_labels = sorted(set(target_labels.tolist()))
     random_state = np.random.get_state()
@@ -214,6 +274,7 @@ def generate_virtual_slice(
 
             transported_parts = []
             label_diags: List[Dict[str, Any]] = []
+            part_weights: list[float] = []
             for ref in eligible_refs:
                 ref_label = ref.labels[label]
                 plan = _solve_label_transport(
@@ -223,12 +284,18 @@ def generate_virtual_slice(
                     target_boundary=target_boundary_label,
                     config=gen_cfg,
                 )
-                transported_parts.append(
-                    _transport_quantiles(
-                        plan,
-                        ref_label.quantiles,
-                        assignment_randomness=float(gen_cfg.assignment_randomness),
-                    )
+                part = _transport_reference_latent_scores(
+                    plan,
+                    ref_label.quantiles,
+                    assignment_randomness=float(gen_cfg.assignment_randomness),
+                    clip_eps=float(q_cfg.latent_clip_eps),
+                    gene_chunk_size=int(q_cfg.gene_chunk_size),
+                )
+                transported_parts.append(part)
+                part_weights.append(float(ref_weights[ref.reference_name]))
+                ref_conflict = reference_conflict_score(
+                    transported_parts,
+                    part_weights,
                 )
                 label_diags.append(
                     {
@@ -237,14 +304,24 @@ def generate_virtual_slice(
                         "source_spots": int(ref_label.quantiles.shape[0]),
                         "target_spots": int(len(target_indices)),
                         "assignment_randomness": float(gen_cfg.assignment_randomness),
+                        "quantile_field_mode": quantile_field_mode,
+                        "reference_conflict_score": float(ref_conflict),
                     }
                 )
             transport_diagnostics[label] = label_diags
 
-            combined = np.zeros((len(target_indices), n_genes), dtype=np.float64)
-            for ref, part in zip(eligible_refs, transported_parts):
-                combined += float(ref_weights[ref.reference_name]) * part
-            quantiles[target_indices, :] = np.clip(combined, 0.0, 1.0).astype(np.float32, copy=False)
+            conflict = reference_conflict_score(transported_parts, part_weights)
+            if q_cfg.reference_conflict_policy == "highest_weight" and conflict >= 0.9:
+                chosen_idx = int(np.argmax(np.asarray(part_weights, dtype=float)))
+                combined_scores = np.asarray(transported_parts[chosen_idx], dtype=np.float32)
+            else:
+                combined_scores = combine_weighted_arrays(transported_parts, part_weights)
+            combined_latent_scores[target_indices, :] = combined_scores.astype(np.float32, copy=False)
+            q_meta = {
+                "reference_conflict_score": float(conflict),
+                "reference_conflict_policy": str(q_cfg.reference_conflict_policy),
+            }
+            quantile_field_labels[label] = q_meta
 
             label_cloud = _resolve_parameter_cloud(
                 parameter_cloud=parameter_cloud,
@@ -252,6 +329,7 @@ def generate_virtual_slice(
                 gene_names=model.gene_names,
                 eligible_refs=eligible_refs,
                 reference_weights=ref_weights,
+                target_parameter_mode=str(q_cfg.target_parameter_mode),
             )
             label_clouds[label] = label_cloud
             label_cloud_out[label] = {
@@ -261,6 +339,27 @@ def generate_virtual_slice(
             }
     finally:
         np.random.set_state(random_state)
+
+    global_q_meta: Dict[str, Any] = {}
+    resolved_scope = resolve_auto_rank_scope(
+        requested_scope=str(q_cfg.rank_scope),
+        coordinate_dim=int(target_coords_raw.shape[1]),
+        domain_specific=True,
+        stack_like=target_coords_raw.shape[1] >= 3 and len(np.unique(target_coords_raw[:, 2])) > 1,
+    )
+    quantiles, global_q_meta = rank_normalize_by_scope(
+        combined_latent_scores,
+        labels=target_labels,
+        coordinates=target_coords_raw,
+        rank_scope=resolved_scope,
+        tie_policy=str(q_cfg.tie_policy),
+        clip_eps=float(q_cfg.latent_clip_eps),
+        random_seed=int(random_seed),
+        tie_jitter_scale=float(q_cfg.tie_jitter_scale),
+        min_rank_scope_size=int(q_cfg.min_rank_scope_size),
+    )
+    if latent_scores_store is not None:
+        latent_scores_store[:, :] = combined_latent_scores
 
     quantiles = diffuse_quantile_map(
         quantiles,
@@ -310,6 +409,7 @@ def generate_virtual_slice(
             if reference_weights is not None
             else {ref.reference_name: 1.0 / len(model.references) for ref in model.references}
         ),
+        target_parameter_mode=str(q_cfg.target_parameter_mode),
     )
     var = pd.DataFrame(index=model.gene_names)
     var["target_mean"] = global_cloud["mean"].to_numpy(dtype=np.float64)
@@ -318,7 +418,15 @@ def generate_virtual_slice(
 
     result = ad.AnnData(X=counts, obs=obs, var=var)
     result.layers["counts"] = counts.astype(np.int32, copy=False)
-    result.layers["transported_quantiles"] = quantiles.astype(np.float32, copy=False)
+    store_q = should_store_quantiles(
+        q_cfg.store_quantiles,
+        int(np.prod(quantiles.shape)),
+        int(q_cfg.max_stored_quantile_elements),
+    )
+    if store_q:
+        result.layers["feast_quantiles"] = quantiles.astype(np.float32, copy=False)
+    if latent_scores_store is not None:
+        result.layers["latent_scores"] = latent_scores_store.astype(np.float32, copy=False)
     result.uns["de_novo"] = {
         "conditional_generation": True,
         "label_key": model.label_key,
@@ -332,6 +440,25 @@ def generate_virtual_slice(
         "boundary_softness": float(gen_cfg.boundary_softness),
         "assignment_randomness": float(gen_cfg.assignment_randomness),
         "mask": mask_metadata,
+        "quantile_field": {
+            "method_version": "latent_v1",
+            "mode": quantile_field_mode,
+            "source": "reference_transport",
+            "requested_rank_scope": str(q_cfg.rank_scope),
+            "resolved_rank_scope": global_q_meta.get("resolved_rank_scope"),
+            "rank_scope_metadata": global_q_meta,
+            "labels": quantile_field_labels,
+            "tie_policy": str(q_cfg.tie_policy),
+            "latent_clip_eps": float(q_cfg.latent_clip_eps),
+            "tie_jitter_scale": float(q_cfg.tie_jitter_scale),
+            "target_parameter_mode": str(q_cfg.target_parameter_mode),
+            "reference_conflict_policy": str(q_cfg.reference_conflict_policy),
+            "gene_chunk_size": int(q_cfg.gene_chunk_size),
+            "store_latent_scores": bool(q_cfg.store_latent_scores),
+            "store_quantiles": q_cfg.store_quantiles,
+            "quantiles_stored": bool(store_q),
+            "random_seed": int(random_seed),
+        },
     }
     assign_generated_coordinates(result, target_coords_raw)
     result.uns["target_blueprint"] = blueprint.to_dict()
@@ -365,7 +492,7 @@ def _common_gene_names(slices: Sequence[ad.AnnData]) -> List[str]:
 def _filter_common_genes(
     slices: Sequence[ad.AnnData],
     common_genes: Sequence[str],
-    config: ConditionalReferenceConfig,
+    config: ReferenceFitConfig,
 ) -> List[str]:
     mean_values = []
     zero_props = []
@@ -458,9 +585,9 @@ def _calculate_quantiles(matrix: np.ndarray) -> np.ndarray:
             while end < n and values[end] == values[start]:
                 end += 1
             avg_rank = 0.5 * (start + end - 1)
-            ranks[order[start:end], j] = avg_rank
+            ranks[order[start:end], j] = (avg_rank + 0.5) / float(n)
             start = end
-    return (ranks / float(n - 1)).astype(np.float32, copy=False)
+    return np.clip(ranks, 1e-6, 1.0 - 1e-6).astype(np.float32, copy=False)
 
 
 def _normalize_label_coordinates(coords: np.ndarray) -> np.ndarray:
@@ -603,7 +730,7 @@ def _solve_label_transport(
     target_coords: np.ndarray,
     source_boundary: np.ndarray,
     target_boundary: np.ndarray,
-    config: VirtualSliceGenerationConfig,
+    config: SimulationConfig,
 ) -> np.ndarray:
     source_coords = np.asarray(source_coords, dtype=np.float32)
     target_coords = np.asarray(target_coords, dtype=np.float32)
@@ -635,24 +762,42 @@ def _solve_label_transport(
     return plan.detach().cpu().numpy().astype(np.float32, copy=False)
 
 
-def _transport_quantiles(plan: np.ndarray, quantiles: np.ndarray, assignment_randomness: float) -> np.ndarray:
+def _transport_reference_latent_scores(
+    plan: np.ndarray,
+    quantiles: np.ndarray,
+    *,
+    assignment_randomness: float,
+    clip_eps: float,
+    gene_chunk_size: int,
+) -> np.ndarray:
     plan = np.asarray(plan, dtype=np.float64)
     quantiles = np.asarray(quantiles, dtype=np.float64)
     if plan.shape[0] != quantiles.shape[0]:
         raise ValueError("transport plan source dimension does not match source quantiles.")
-    if plan.shape[1] == 0:
-        return np.zeros((0, quantiles.shape[1]), dtype=np.float32)
+    n_target = int(plan.shape[1])
+    n_genes = int(quantiles.shape[1])
+    if n_target == 0:
+        return np.zeros((0, n_genes), dtype=np.float32)
 
-    column_mass = plan.sum(axis=0, keepdims=True)
-    safe_mass = np.where(column_mass > 1e-12, column_mass, 1.0)
-    weights = plan / safe_mass
-    transported = weights.T @ quantiles
-
+    out = np.zeros((n_target, n_genes), dtype=np.float32)
+    chunk_size = max(1, int(gene_chunk_size))
     randomness = float(np.clip(assignment_randomness, 0.0, 1.0))
-    if randomness > 0 and quantiles.shape[0] > 0:
-        sampled = quantiles[np.random.randint(0, quantiles.shape[0], size=plan.shape[1]), :]
-        transported = (1.0 - randomness) * transported + randomness * sampled
-    return np.clip(transported, 0.0, 1.0).astype(np.float32, copy=False)
+    sampled_indices = None
+    if randomness > 0.0 and quantiles.shape[0] > 0:
+        sampled_indices = np.random.randint(0, quantiles.shape[0], size=n_target)
+
+    for start in range(0, n_genes, chunk_size):
+        end = min(start + chunk_size, n_genes)
+        source_scores = quantiles_to_normal_scores(
+            quantiles[:, start:end],
+            clip_eps=float(clip_eps),
+        )
+        part = transport_latent_scores(plan, source_scores)
+        if sampled_indices is not None:
+            sampled = source_scores[sampled_indices, :]
+            part = (1.0 - randomness) * part + randomness * sampled
+        out[:, start:end] = np.asarray(part, dtype=np.float32)
+    return out
 
 
 def _decode_label_aware_rank_counts(
@@ -731,9 +876,12 @@ def _resolve_parameter_cloud(
     gene_names: Sequence[str],
     eligible_refs: Sequence[ReferenceSliceData],
     reference_weights: Mapping[str, float],
+    target_parameter_mode: str = "reference_weighted_log",
 ) -> pd.DataFrame:
     if parameter_cloud is None:
-        return _weighted_label_stats(label, gene_names, eligible_refs, reference_weights)
+        if str(target_parameter_mode) == "user_supplied":
+            raise ValueError("parameter_cloud is required when target_parameter_mode='user_supplied'.")
+        return _weighted_label_stats(label, gene_names, eligible_refs, reference_weights, target_parameter_mode)
 
     if isinstance(parameter_cloud, pd.DataFrame):
         return _normalize_stats_frame(parameter_cloud, gene_names)
@@ -752,6 +900,7 @@ def _resolve_parameter_cloud(
             gene_names=gene_names,
             eligible_refs=eligible_refs,
             reference_weights=reference_weights,
+            target_parameter_mode=target_parameter_mode,
         )
     if "__default__" in parameter_cloud:
         return _resolve_parameter_cloud(
@@ -760,6 +909,7 @@ def _resolve_parameter_cloud(
             gene_names=gene_names,
             eligible_refs=eligible_refs,
             reference_weights=reference_weights,
+            target_parameter_mode=target_parameter_mode,
         )
 
     raise TypeError("Unsupported parameter_cloud input for conditional de_novo generation.")
@@ -770,6 +920,7 @@ def _weighted_label_stats(
     gene_names: Sequence[str],
     eligible_refs: Sequence[ReferenceSliceData],
     reference_weights: Mapping[str, float],
+    target_parameter_mode: str = "reference_weighted_log",
 ) -> pd.DataFrame:
     if label is None:
         frames = []
@@ -778,10 +929,16 @@ def _weighted_label_stats(
             for ref_label in ref.labels.values():
                 frames.append(ref_label.stats)
                 weights.append(1.0 / max(len(eligible_refs) * len(ref.labels), 1))
+        if str(target_parameter_mode) == "reference_weighted_log":
+            return weighted_stats_log_space(frames, np.asarray(weights, dtype=float), gene_names)
         return _weighted_stats(frames, np.asarray(weights, dtype=float), gene_names)
 
     frames = [ref.labels[label].stats for ref in eligible_refs]
     weights = np.asarray([reference_weights[ref.reference_name] for ref in eligible_refs], dtype=float)
+    if str(target_parameter_mode) == "nearest_reference":
+        return _normalize_stats_frame(frames[int(np.argmax(weights))], gene_names)
+    if str(target_parameter_mode) == "reference_weighted_log":
+        return weighted_stats_log_space(frames, weights, gene_names)
     return _weighted_stats(frames, weights, gene_names)
 
 
