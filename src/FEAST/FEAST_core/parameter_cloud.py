@@ -259,11 +259,9 @@ class GeneParameterSimulator:
         if len(synthetic_df) < len(self.original_stats):
             raise ValueError("Fewer synthetic profiles than real genes. Increase overgeneration_factor.")
 
-        rng = np.random.default_rng(None if random_seed is None else int(random_seed))
         n_genes = len(self.original_stats)
-        subset_idx = rng.choice(len(synthetic_df), size=n_genes, replace=False)
-        synthetic_subset = synthetic_df.iloc[subset_idx].reset_index(drop=True)
-        sampled_u = np.asarray(synthetic_uniform, dtype=float)[subset_idx, :]
+        synthetic_subset = synthetic_df.reset_index(drop=True)
+        sampled_u = np.asarray(synthetic_uniform, dtype=float)
 
         original_u = pseudo_observations(self.original_stats).to_numpy(dtype=float)
         weight_vector = _assignment_weight_vector(weights)
@@ -280,6 +278,7 @@ class GeneParameterSimulator:
             'max_cost': float(np.max(selected_costs)) if selected_costs.size else 0.0,
             'total_cost': float(np.sum(selected_costs)),
             'n_profiles': int(n_genes),
+            'n_candidates': int(len(synthetic_subset)),
             'weights': {
                 'mean': float(weight_vector[0]),
                 'variance': float(weight_vector[1]),

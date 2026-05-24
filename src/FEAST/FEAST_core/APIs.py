@@ -84,6 +84,7 @@ class FEAST:
         alteration_config: Optional[Any] = None,
         boundary_multiplier: float = 1.1,
         simulation_mode: str = "generative",
+        quantile_calibration: Optional[str] = None,
         random_seed: Optional[int] = None,
     ) -> ad.AnnData:
         if verbose is None:
@@ -105,6 +106,7 @@ class FEAST:
             alteration_config=alteration_config,
             boundary_multiplier=boundary_multiplier,
             simulation_mode=simulation_mode,
+            quantile_calibration=quantile_calibration,
             random_seed=random_seed,
         )
 
@@ -139,6 +141,7 @@ class FEAST:
         alteration_config: Optional[Any] = None,
         boundary_multiplier: float = 1.1,
         simulation_mode: str = "generative",
+        quantile_calibration: Optional[str] = None,
         random_seed: Optional[int] = None,
         verbose: Optional[bool] = None,
     ) -> tuple:
@@ -160,6 +163,7 @@ class FEAST:
             "alteration_config": alteration_config,
             "boundary_multiplier": boundary_multiplier,
             "simulation_mode": simulation_mode,
+            "quantile_calibration": quantile_calibration,
             "random_seed": random_seed,
             "verbose": verbose,
         }
