@@ -5,6 +5,9 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
+from scipy.sparse import linalg as sparse_linalg
+from scipy.spatial import cKDTree
 from scipy.special import expit, logit
 from scipy.stats import norm
 
@@ -21,7 +24,12 @@ QUANTILE_FIELD_MODES = {
 }
 RANK_SCOPES = {"auto", "volume", "slice", "domain", "domain_slice", "scaffold"}
 TIE_POLICIES = {"stable_ordinal", "average", "seeded_jitter"}
-TARGET_PARAMETER_MODES = {"reference_weighted_log", "nearest_reference", "user_supplied"}
+TARGET_PARAMETER_MODES = {
+    "reference_weighted_log",
+    "nearest_reference",
+    "user_supplied",
+    "depth_gp_log",
+}
 REFERENCE_CONFLICT_POLICIES = {"average", "highest_weight"}
 
 
@@ -41,6 +49,17 @@ class QuantileFieldConfig:
     reference_conflict_policy: str = "average"
     program_noise_scale: float = 0.0
     program_normalization: str = "zscore"
+    posterior_sigma0: float = 1e-3
+    posterior_alpha_z: float = 1.0
+    posterior_alpha_cost: float = 1.0
+    posterior_alpha_transport: float = 1.0
+    posterior_alpha_quality: float = 0.0
+    posterior_lambda0: float = 0.0
+    posterior_lambda_s: float = 0.0
+    posterior_graph_neighbors: int = 6
+    posterior_variance_floor: float = 1e-8
+    parameter_gp_length_scale: float = 1.0
+    parameter_gp_noise: float = 1e-3
 
 
 def validate_quantile_field_config(config: QuantileFieldConfig) -> QuantileFieldConfig:
@@ -62,6 +81,26 @@ def validate_quantile_field_config(config: QuantileFieldConfig) -> QuantileField
         raise ValueError("min_rank_scope_size must be positive.")
     if int(config.gene_chunk_size) < 1:
         raise ValueError("gene_chunk_size must be positive.")
+    if float(config.posterior_sigma0) <= 0.0:
+        raise ValueError("posterior_sigma0 must be positive.")
+    for name in (
+        "posterior_alpha_z",
+        "posterior_alpha_cost",
+        "posterior_alpha_transport",
+        "posterior_alpha_quality",
+        "posterior_lambda0",
+        "posterior_lambda_s",
+    ):
+        if float(getattr(config, name)) < 0.0:
+            raise ValueError(f"{name} must be non-negative.")
+    if int(config.posterior_graph_neighbors) < 1:
+        raise ValueError("posterior_graph_neighbors must be positive.")
+    if float(config.posterior_variance_floor) <= 0.0:
+        raise ValueError("posterior_variance_floor must be positive.")
+    if float(config.parameter_gp_length_scale) <= 0.0:
+        raise ValueError("parameter_gp_length_scale must be positive.")
+    if float(config.parameter_gp_noise) < 0.0:
+        raise ValueError("parameter_gp_noise must be non-negative.")
     return config
 
 
@@ -139,21 +178,269 @@ def transport_latent_scores(plan: np.ndarray, latent_scores: np.ndarray) -> np.n
     return (weights.T @ scores).astype(np.float32, copy=False)
 
 
-def combine_weighted_arrays(parts: Sequence[np.ndarray], weights: Sequence[float]) -> np.ndarray:
-    if not parts:
-        raise ValueError("parts must contain at least one array.")
-    weights_arr = np.asarray(weights, dtype=np.float64).reshape(-1)
-    if weights_arr.shape[0] != len(parts):
-        raise ValueError("weights length must match parts length.")
-    weights_arr = np.clip(weights_arr, 0.0, None)
-    total = float(weights_arr.sum())
-    if total <= 0.0:
-        raise ValueError("weights must contain positive mass.")
-    weights_arr = weights_arr / total
-    out = np.zeros_like(np.asarray(parts[0], dtype=np.float64))
-    for weight, part in zip(weights_arr, parts):
-        out += float(weight) * np.asarray(part, dtype=np.float64)
-    return out.astype(np.float32, copy=False)
+def transport_plan_target_uncertainty(
+    plan: np.ndarray,
+    cost_matrix: np.ndarray,
+    source_coords: np.ndarray,
+    target_coords: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    plan = np.asarray(plan, dtype=np.float64)
+    cost = np.asarray(cost_matrix, dtype=np.float64)
+    source = np.asarray(source_coords, dtype=np.float64)
+    target = np.asarray(target_coords, dtype=np.float64)
+    if plan.shape != cost.shape:
+        raise ValueError("transport plan and cost matrix must have matching shapes.")
+    if plan.shape[0] != source.shape[0]:
+        raise ValueError("source coordinate rows must match transport source dimension.")
+    if plan.shape[1] != target.shape[0]:
+        raise ValueError("target coordinate rows must match transport target dimension.")
+    if source.ndim != 2 or target.ndim != 2 or source.shape[1] != target.shape[1]:
+        raise ValueError("source_coords and target_coords must be 2D arrays with the same dimensionality.")
+    n_target = int(plan.shape[1])
+    if n_target == 0:
+        empty = np.zeros(0, dtype=np.float32)
+        return {"target_cost": empty, "target_variance": empty, "target_mass": empty}
+
+    column_mass = plan.sum(axis=0)
+    safe_mass = np.where(column_mass > 1e-12, column_mass, 1.0)
+    weights = plan / safe_mass[None, :]
+    target_cost = np.sum(weights * cost, axis=0)
+    deltas = source[:, None, :] - target[None, :, :]
+    squared_distance = np.sum(deltas * deltas, axis=2)
+    mean_squared_distance = np.sum(weights * squared_distance, axis=0)
+    barycenter = weights.T @ source
+    barycenter_distance = np.sum((barycenter - target) ** 2, axis=1)
+    target_variance = np.maximum(mean_squared_distance - barycenter_distance, 0.0)
+    return {
+        "target_cost": target_cost.astype(np.float32, copy=False),
+        "target_variance": target_variance.astype(np.float32, copy=False),
+        "target_mass": column_mass.astype(np.float32, copy=False),
+    }
+
+
+def posterior_observation_variance(
+    *,
+    target_coords: np.ndarray,
+    reference_coords: np.ndarray,
+    transport_cost: np.ndarray,
+    transport_variance: np.ndarray,
+    sigma0: float,
+    alpha_z: float,
+    alpha_cost: float,
+    alpha_transport: float,
+    alpha_quality: float = 0.0,
+    quality_noise: float = 0.0,
+    variance_floor: float = 1e-8,
+) -> tuple[np.ndarray, Dict[str, float]]:
+    target = np.asarray(target_coords, dtype=np.float64)
+    reference = np.asarray(reference_coords, dtype=np.float64)
+    cost = np.asarray(transport_cost, dtype=np.float64).reshape(-1)
+    dispersion = np.asarray(transport_variance, dtype=np.float64).reshape(-1)
+    if target.ndim != 2:
+        raise ValueError("target_coords must be a 2D array.")
+    if reference.ndim != 2:
+        raise ValueError("reference_coords must be a 2D array.")
+    if cost.shape[0] != target.shape[0] or dispersion.shape[0] != target.shape[0]:
+        raise ValueError("transport uncertainty vectors must have one value per target spot.")
+
+    if target.shape[1] >= 3 and reference.shape[1] >= 3 and reference.shape[0] > 0:
+        reference_z = float(np.mean(reference[:, 2]))
+        z_delta2 = (target[:, 2] - reference_z) ** 2
+    else:
+        reference_z = 0.0
+        z_delta2 = np.zeros(target.shape[0], dtype=np.float64)
+
+    variance = (
+        float(sigma0) ** 2
+        + float(alpha_z) * z_delta2
+        + float(alpha_cost) * np.clip(cost, 0.0, None)
+        + float(alpha_transport) * np.clip(dispersion, 0.0, None)
+        + float(alpha_quality) * max(float(quality_noise), 0.0)
+    )
+    variance = np.clip(variance, float(variance_floor), None)
+    metadata = {
+        "variance_min": float(np.min(variance)) if variance.size else 0.0,
+        "variance_median": float(np.median(variance)) if variance.size else 0.0,
+        "variance_max": float(np.max(variance)) if variance.size else 0.0,
+        "transport_cost_mean": float(np.mean(cost)) if cost.size else 0.0,
+        "transport_variance_mean": float(np.mean(dispersion)) if dispersion.size else 0.0,
+        "z_distance_mean": float(np.mean(np.sqrt(z_delta2))) if z_delta2.size else 0.0,
+        "reference_z": float(reference_z),
+    }
+    return variance.astype(np.float32, copy=False), metadata
+
+
+def build_target_graph_laplacian(
+    coordinates: np.ndarray,
+    *,
+    labels: Optional[Sequence[Any]] = None,
+    n_neighbors: int = 6,
+) -> tuple[sparse.csr_matrix, Dict[str, Any]]:
+    coords = np.asarray(coordinates, dtype=np.float64)
+    if coords.ndim != 2:
+        raise ValueError("coordinates must be a 2D array.")
+    n_spots = int(coords.shape[0])
+    if n_spots == 0:
+        return sparse.csr_matrix((0, 0), dtype=np.float64), {
+            "n_spots": 0,
+            "n_edges": 0,
+            "n_neighbors": int(n_neighbors),
+            "same_label_only": labels is not None,
+        }
+    if n_spots == 1:
+        return sparse.csr_matrix((1, 1), dtype=np.float64), {
+            "n_spots": 1,
+            "n_edges": 0,
+            "n_neighbors": int(n_neighbors),
+            "same_label_only": labels is not None,
+        }
+
+    labels_arr = None
+    if labels is not None:
+        labels_arr = np.asarray(labels).astype(str)
+        if labels_arr.shape[0] != n_spots:
+            raise ValueError("labels length must match coordinate rows.")
+
+    k = min(max(1, int(n_neighbors)), n_spots - 1)
+    distances, indices = cKDTree(coords).query(coords, k=k + 1)
+    distances = np.asarray(distances, dtype=np.float64)
+    indices = np.asarray(indices, dtype=int)
+    if indices.ndim == 1:
+        indices = indices[:, None]
+        distances = distances[:, None]
+
+    finite_distances = distances[:, 1:][np.isfinite(distances[:, 1:])]
+    scale = float(np.median(finite_distances)) if finite_distances.size else 1.0
+    scale = max(scale, 1e-8)
+    rows: list[int] = []
+    cols: list[int] = []
+    data: list[float] = []
+    for row_idx in range(n_spots):
+        for distance, col_idx in zip(distances[row_idx, 1:], indices[row_idx, 1:]):
+            if col_idx < 0 or col_idx == row_idx or not np.isfinite(distance):
+                continue
+            if labels_arr is not None and labels_arr[row_idx] != labels_arr[int(col_idx)]:
+                continue
+            weight = float(np.exp(-0.5 * (float(distance) / scale) ** 2))
+            rows.append(row_idx)
+            cols.append(int(col_idx))
+            data.append(weight)
+
+    if not data:
+        graph = sparse.csr_matrix((n_spots, n_spots), dtype=np.float64)
+    else:
+        graph = sparse.coo_matrix((data, (rows, cols)), shape=(n_spots, n_spots), dtype=np.float64).tocsr()
+        graph = graph.maximum(graph.T)
+    degree = np.asarray(graph.sum(axis=1)).reshape(-1)
+    laplacian = sparse.diags(degree, format="csr") - graph
+    metadata = {
+        "n_spots": n_spots,
+        "n_edges": int(graph.nnz // 2),
+        "n_neighbors": int(k),
+        "same_label_only": labels is not None,
+    }
+    return laplacian.tocsr(), metadata
+
+
+def infer_latent_posterior(
+    reference_fields: Sequence[np.ndarray],
+    observation_variances: Sequence[np.ndarray],
+    *,
+    prior_mean: Optional[np.ndarray] = None,
+    coordinates: Optional[np.ndarray] = None,
+    labels: Optional[Sequence[Any]] = None,
+    lambda0: float = 0.0,
+    lambda_s: float = 0.0,
+    graph_neighbors: int = 6,
+    variance_floor: float = 1e-8,
+) -> tuple[np.ndarray, Dict[str, Any]]:
+    if len(reference_fields) != len(observation_variances):
+        raise ValueError("reference_fields and observation_variances must have the same length.")
+    if not reference_fields and prior_mean is None:
+        raise ValueError("At least one reference field or a prior_mean is required.")
+
+    if reference_fields:
+        first = np.asarray(reference_fields[0], dtype=np.float64)
+    else:
+        first = np.asarray(prior_mean, dtype=np.float64)
+    if first.ndim != 2:
+        raise ValueError("latent fields must be 2D arrays.")
+    n_spots, n_genes = first.shape
+    rhs = np.zeros((n_spots, n_genes), dtype=np.float64)
+    precision_sum = np.zeros(n_spots, dtype=np.float64)
+    variance_summaries: list[Dict[str, float]] = []
+
+    for field, variance in zip(reference_fields, observation_variances):
+        y = np.asarray(field, dtype=np.float64)
+        if y.shape != (n_spots, n_genes):
+            raise ValueError("All reference fields must share the same shape.")
+        var = np.asarray(variance, dtype=np.float64).reshape(-1)
+        if var.shape[0] != n_spots:
+            raise ValueError("Each observation variance vector must have one value per target spot.")
+        var = np.clip(var, float(variance_floor), None)
+        precision = 1.0 / var
+        rhs += precision[:, None] * y
+        precision_sum += precision
+        variance_summaries.append(
+            {
+                "variance_min": float(np.min(var)) if var.size else 0.0,
+                "variance_median": float(np.median(var)) if var.size else 0.0,
+                "variance_max": float(np.max(var)) if var.size else 0.0,
+            }
+        )
+
+    effective_lambda0 = float(lambda0)
+    if not reference_fields and prior_mean is not None and effective_lambda0 <= 0.0:
+        effective_lambda0 = 1.0
+    prior_used = prior_mean is not None and effective_lambda0 > 0.0
+    if effective_lambda0 > 0.0:
+        if prior_mean is None:
+            prior = np.zeros((n_spots, n_genes), dtype=np.float64)
+        else:
+            prior = np.asarray(prior_mean, dtype=np.float64)
+            if prior.shape != (n_spots, n_genes):
+                raise ValueError("prior_mean must match latent field shape.")
+        rhs += effective_lambda0 * prior
+        precision_sum += effective_lambda0
+
+    graph_metadata: Dict[str, Any] = {
+        "enabled": bool(float(lambda_s) > 0.0),
+        "lambda_s": float(lambda_s),
+        "n_neighbors": int(graph_neighbors),
+    }
+    if float(lambda_s) > 0.0:
+        if coordinates is None:
+            raise ValueError("coordinates are required when lambda_s is positive.")
+        laplacian, lap_meta = build_target_graph_laplacian(
+            coordinates,
+            labels=labels,
+            n_neighbors=int(graph_neighbors),
+        )
+        graph_metadata.update(lap_meta)
+        system = sparse.diags(np.clip(precision_sum, float(variance_floor), None), format="csr")
+        system = system + float(lambda_s) * laplacian
+        solved = sparse_linalg.spsolve(system.tocsc(), rhs)
+        h = np.asarray(solved, dtype=np.float64)
+        if h.ndim == 1:
+            h = h[:, None]
+    else:
+        safe_precision = np.clip(precision_sum, float(variance_floor), None)
+        h = rhs / safe_precision[:, None]
+
+    metadata = {
+        "n_references": int(len(reference_fields)),
+        "prior_mean_used": bool(prior_used),
+        "lambda0": float(lambda0),
+        "effective_lambda0": float(effective_lambda0),
+        "lambda_s": float(lambda_s),
+        "precision_min": float(np.min(precision_sum)) if precision_sum.size else 0.0,
+        "precision_median": float(np.median(precision_sum)) if precision_sum.size else 0.0,
+        "precision_max": float(np.max(precision_sum)) if precision_sum.size else 0.0,
+        "variance_floor": float(variance_floor),
+        "reference_variance_summaries": variance_summaries,
+        "graph": graph_metadata,
+    }
+    return h.astype(np.float32, copy=False), metadata
 
 
 def reference_conflict_score(parts: Sequence[np.ndarray], weights: Sequence[float]) -> float:

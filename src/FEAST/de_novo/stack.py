@@ -110,6 +110,8 @@ def simulate_stack(
             "z0": z0,
             "z1": z1,
             "tau": float(tau),
+            "tau_role": "bracketing_provenance",
+            "latent_field_rule": "posterior_evidence_precision",
             "reference_z_values": [z0, z1],
             "reference_names": [ref.reference_name for ref in model.references],
             "reference_weights": dict(reference_weights),

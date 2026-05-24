@@ -8,6 +8,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import torch
+from scipy.special import expit, logit
 from sklearn.neighbors import NearestNeighbors
 
 from ..FEAST_core.count_decoding import decode_counts_from_quantiles, resolve_decode_method
@@ -16,12 +17,14 @@ from ._transport import log_sinkhorn
 from .core import SliceBlueprint, active_mask_metadata, assign_generated_coordinates, load_blueprint
 from .pattern import diffuse_quantile_map
 from .quantile_field import (
-    combine_weighted_arrays,
+    infer_latent_posterior,
+    posterior_observation_variance,
     quantiles_to_normal_scores,
     rank_normalize_by_scope,
     reference_conflict_score,
     resolve_auto_rank_scope,
     should_store_quantiles,
+    transport_plan_target_uncertainty,
     transport_latent_scores,
     validate_quantile_field_config,
     weighted_stats_log_space,
@@ -72,6 +75,17 @@ class SimulationConfig:
     reference_conflict_policy: str = "average"
     program_noise_scale: float = 0.0
     program_normalization: str = "zscore"
+    posterior_sigma0: float = 1e-3
+    posterior_alpha_z: float = 1.0
+    posterior_alpha_cost: float = 1.0
+    posterior_alpha_transport: float = 1.0
+    posterior_alpha_quality: float = 0.0
+    posterior_lambda0: float = 0.0
+    posterior_lambda_s: float = 0.0
+    posterior_graph_neighbors: int = 6
+    posterior_variance_floor: float = 1e-8
+    parameter_gp_length_scale: float = 1.0
+    parameter_gp_noise: float = 1e-3
 
 
 def _quantile_field_config(config: SimulationConfig) -> QuantileFieldConfig:
@@ -91,6 +105,17 @@ def _quantile_field_config(config: SimulationConfig) -> QuantileFieldConfig:
             reference_conflict_policy=str(config.reference_conflict_policy),
             program_noise_scale=float(config.program_noise_scale),
             program_normalization=str(config.program_normalization),
+            posterior_sigma0=float(config.posterior_sigma0),
+            posterior_alpha_z=float(config.posterior_alpha_z),
+            posterior_alpha_cost=float(config.posterior_alpha_cost),
+            posterior_alpha_transport=float(config.posterior_alpha_transport),
+            posterior_alpha_quality=float(config.posterior_alpha_quality),
+            posterior_lambda0=float(config.posterior_lambda0),
+            posterior_lambda_s=float(config.posterior_lambda_s),
+            posterior_graph_neighbors=int(config.posterior_graph_neighbors),
+            posterior_variance_floor=float(config.posterior_variance_floor),
+            parameter_gp_length_scale=float(config.parameter_gp_length_scale),
+            parameter_gp_noise=float(config.parameter_gp_noise),
         )
     )
 
@@ -273,16 +298,25 @@ def simulate_from_reference(
             label_weights_out[label] = ref_weights
 
             transported_parts = []
+            observation_variances = []
             label_diags: List[Dict[str, Any]] = []
             part_weights: list[float] = []
             for ref in eligible_refs:
                 ref_label = ref.labels[label]
+                cost_matrix = _label_transport_cost_matrix(
+                    source_coords=ref_label.normalized_coordinates,
+                    target_coords=target_coords_norm,
+                    source_boundary=ref_label.boundary_scores,
+                    target_boundary=target_boundary_label,
+                    config=gen_cfg,
+                )
                 plan = _solve_label_transport(
                     source_coords=ref_label.normalized_coordinates,
                     target_coords=target_coords_norm,
                     source_boundary=ref_label.boundary_scores,
                     target_boundary=target_boundary_label,
                     config=gen_cfg,
+                    cost_matrix=cost_matrix,
                 )
                 part = _transport_reference_latent_scores(
                     plan,
@@ -291,7 +325,27 @@ def simulate_from_reference(
                     clip_eps=float(q_cfg.latent_clip_eps),
                     gene_chunk_size=int(q_cfg.gene_chunk_size),
                 )
+                uncertainty = transport_plan_target_uncertainty(
+                    plan,
+                    cost_matrix,
+                    ref_label.normalized_coordinates,
+                    target_coords_norm,
+                )
+                obs_variance, variance_meta = posterior_observation_variance(
+                    target_coords=target_coords_raw[target_mask],
+                    reference_coords=ref_label.coordinates,
+                    transport_cost=uncertainty["target_cost"],
+                    transport_variance=uncertainty["target_variance"],
+                    sigma0=float(q_cfg.posterior_sigma0),
+                    alpha_z=float(q_cfg.posterior_alpha_z),
+                    alpha_cost=float(q_cfg.posterior_alpha_cost),
+                    alpha_transport=float(q_cfg.posterior_alpha_transport),
+                    alpha_quality=float(q_cfg.posterior_alpha_quality),
+                    quality_noise=(1.0 / max(float(ref_weights[ref.reference_name]), 1e-6)) - 1.0,
+                    variance_floor=float(q_cfg.posterior_variance_floor),
+                )
                 transported_parts.append(part)
+                observation_variances.append(obs_variance)
                 part_weights.append(float(ref_weights[ref.reference_name]))
                 ref_conflict = reference_conflict_score(
                     transported_parts,
@@ -306,20 +360,38 @@ def simulate_from_reference(
                         "assignment_randomness": float(gen_cfg.assignment_randomness),
                         "quantile_field_mode": quantile_field_mode,
                         "reference_conflict_score": float(ref_conflict),
+                        "observation_variance": variance_meta,
+                        "target_mass_min": (
+                            float(np.min(uncertainty["target_mass"]))
+                            if uncertainty["target_mass"].size
+                            else 0.0
+                        ),
+                        "target_mass_max": (
+                            float(np.max(uncertainty["target_mass"]))
+                            if uncertainty["target_mass"].size
+                            else 0.0
+                        ),
                     }
                 )
             transport_diagnostics[label] = label_diags
 
             conflict = reference_conflict_score(transported_parts, part_weights)
-            if q_cfg.reference_conflict_policy == "highest_weight" and conflict >= 0.9:
-                chosen_idx = int(np.argmax(np.asarray(part_weights, dtype=float)))
-                combined_scores = np.asarray(transported_parts[chosen_idx], dtype=np.float32)
-            else:
-                combined_scores = combine_weighted_arrays(transported_parts, part_weights)
+            combined_scores, posterior_meta = infer_latent_posterior(
+                transported_parts,
+                observation_variances,
+                coordinates=target_coords_label,
+                labels=np.full(len(target_indices), label, dtype=object),
+                lambda0=float(q_cfg.posterior_lambda0),
+                lambda_s=float(q_cfg.posterior_lambda_s),
+                graph_neighbors=int(q_cfg.posterior_graph_neighbors),
+                variance_floor=float(q_cfg.posterior_variance_floor),
+            )
             combined_latent_scores[target_indices, :] = combined_scores.astype(np.float32, copy=False)
             q_meta = {
                 "reference_conflict_score": float(conflict),
                 "reference_conflict_policy": str(q_cfg.reference_conflict_policy),
+                "reference_conflict_policy_role": "diagnostic_only",
+                "posterior": posterior_meta,
             }
             quantile_field_labels[label] = q_meta
 
@@ -330,6 +402,9 @@ def simulate_from_reference(
                 eligible_refs=eligible_refs,
                 reference_weights=ref_weights,
                 target_parameter_mode=str(q_cfg.target_parameter_mode),
+                target_z=_mean_z(target_coords_raw[target_mask]),
+                parameter_gp_length_scale=float(q_cfg.parameter_gp_length_scale),
+                parameter_gp_noise=float(q_cfg.parameter_gp_noise),
             )
             label_clouds[label] = label_cloud
             label_cloud_out[label] = {
@@ -410,6 +485,9 @@ def simulate_from_reference(
             else {ref.reference_name: 1.0 / len(model.references) for ref in model.references}
         ),
         target_parameter_mode=str(q_cfg.target_parameter_mode),
+        target_z=_mean_z(target_coords_raw),
+        parameter_gp_length_scale=float(q_cfg.parameter_gp_length_scale),
+        parameter_gp_noise=float(q_cfg.parameter_gp_noise),
     )
     var = pd.DataFrame(index=model.gene_names)
     var["target_mean"] = global_cloud["mean"].to_numpy(dtype=np.float64)
@@ -441,9 +519,9 @@ def simulate_from_reference(
         "assignment_randomness": float(gen_cfg.assignment_randomness),
         "mask": mask_metadata,
         "quantile_field": {
-            "method_version": "latent_v1",
+            "method_version": "posterior_latent_field_v1",
             "mode": quantile_field_mode,
-            "source": "reference_transport",
+            "source": "ot_registered_posterior",
             "requested_rank_scope": str(q_cfg.rank_scope),
             "resolved_rank_scope": global_q_meta.get("resolved_rank_scope"),
             "rank_scope_metadata": global_q_meta,
@@ -452,7 +530,27 @@ def simulate_from_reference(
             "latent_clip_eps": float(q_cfg.latent_clip_eps),
             "tie_jitter_scale": float(q_cfg.tie_jitter_scale),
             "target_parameter_mode": str(q_cfg.target_parameter_mode),
+            "parameter_gp": {
+                "length_scale": float(q_cfg.parameter_gp_length_scale),
+                "noise": float(q_cfg.parameter_gp_noise),
+                "depth_available": bool(
+                    target_coords_raw.shape[1] >= 3 and int(model.coordinate_dim) >= 3
+                ),
+            },
             "reference_conflict_policy": str(q_cfg.reference_conflict_policy),
+            "posterior_observation_model": {
+                "sigma0": float(q_cfg.posterior_sigma0),
+                "alpha_z": float(q_cfg.posterior_alpha_z),
+                "alpha_cost": float(q_cfg.posterior_alpha_cost),
+                "alpha_transport": float(q_cfg.posterior_alpha_transport),
+                "alpha_quality": float(q_cfg.posterior_alpha_quality),
+                "variance_floor": float(q_cfg.posterior_variance_floor),
+            },
+            "posterior_prior": {
+                "lambda0": float(q_cfg.posterior_lambda0),
+                "lambda_s": float(q_cfg.posterior_lambda_s),
+                "graph_neighbors": int(q_cfg.posterior_graph_neighbors),
+            },
             "gene_chunk_size": int(q_cfg.gene_chunk_size),
             "store_latent_scores": bool(q_cfg.store_latent_scores),
             "store_quantiles": q_cfg.store_quantiles,
@@ -541,6 +639,13 @@ def _apply_coordinate_scale(coords: np.ndarray, coordinate_scale: Optional[Seque
     if scale.shape[0] != arr.shape[1]:
         raise ValueError(f"coordinate_scale must contain {arr.shape[1]} values.")
     return arr * scale[None, :]
+
+
+def _mean_z(coords: np.ndarray) -> Optional[float]:
+    arr = np.asarray(coords, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] < 3 or arr.shape[0] == 0:
+        return None
+    return float(np.mean(arr[:, 2]))
 
 
 def _to_dense_matrix(matrix) -> np.ndarray:
@@ -731,19 +836,25 @@ def _solve_label_transport(
     source_boundary: np.ndarray,
     target_boundary: np.ndarray,
     config: SimulationConfig,
+    cost_matrix: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     source_coords = np.asarray(source_coords, dtype=np.float32)
     target_coords = np.asarray(target_coords, dtype=np.float32)
     if source_coords.shape[0] == 0 or target_coords.shape[0] == 0:
         return np.zeros((source_coords.shape[0], target_coords.shape[0]), dtype=np.float32)
 
-    source_boundary = np.asarray(source_boundary, dtype=np.float32).reshape(-1, 1)
-    target_boundary = np.asarray(target_boundary, dtype=np.float32).reshape(1, -1)
-    source_sq = np.sum(source_coords**2, axis=1, keepdims=True)
-    target_sq = np.sum(target_coords**2, axis=1, keepdims=True).T
-    dist2 = np.maximum(source_sq + target_sq - 2.0 * source_coords @ target_coords.T, 0.0)
-    boundary_cost = np.abs(source_boundary - target_boundary)
-    cost = float(config.geometry_weight) * dist2 + float(config.boundary_weight) * boundary_cost
+    if cost_matrix is None:
+        cost = _label_transport_cost_matrix(
+            source_coords=source_coords,
+            target_coords=target_coords,
+            source_boundary=source_boundary,
+            target_boundary=target_boundary,
+            config=config,
+        )
+    else:
+        cost = np.asarray(cost_matrix, dtype=np.float32)
+        if cost.shape != (source_coords.shape[0], target_coords.shape[0]):
+            raise ValueError("cost_matrix shape must match source and target coordinates.")
     a = np.full(source_coords.shape[0], 1.0 / source_coords.shape[0], dtype=np.float32)
     b = np.full(target_coords.shape[0], 1.0 / target_coords.shape[0], dtype=np.float32)
 
@@ -760,6 +871,31 @@ def _solve_label_transport(
         reg_m=float(config.reg_m),
     )
     return plan.detach().cpu().numpy().astype(np.float32, copy=False)
+
+
+def _label_transport_cost_matrix(
+    source_coords: np.ndarray,
+    target_coords: np.ndarray,
+    source_boundary: np.ndarray,
+    target_boundary: np.ndarray,
+    config: SimulationConfig,
+) -> np.ndarray:
+    source_coords = np.asarray(source_coords, dtype=np.float32)
+    target_coords = np.asarray(target_coords, dtype=np.float32)
+    source_boundary = np.asarray(source_boundary, dtype=np.float32).reshape(-1, 1)
+    target_boundary = np.asarray(target_boundary, dtype=np.float32).reshape(1, -1)
+    if source_coords.ndim != 2 or target_coords.ndim != 2:
+        raise ValueError("source_coords and target_coords must be 2D arrays.")
+    if source_coords.shape[1] != target_coords.shape[1]:
+        raise ValueError("source and target coordinates must have the same dimensionality.")
+    source_sq = np.sum(source_coords**2, axis=1, keepdims=True)
+    target_sq = np.sum(target_coords**2, axis=1, keepdims=True).T
+    dist2 = np.maximum(source_sq + target_sq - 2.0 * source_coords @ target_coords.T, 0.0)
+    boundary_cost = np.abs(source_boundary - target_boundary)
+    return (
+        float(config.geometry_weight) * dist2
+        + float(config.boundary_weight) * boundary_cost
+    ).astype(np.float32, copy=False)
 
 
 def _transport_reference_latent_scores(
@@ -877,11 +1013,23 @@ def _resolve_parameter_cloud(
     eligible_refs: Sequence[ReferenceSliceData],
     reference_weights: Mapping[str, float],
     target_parameter_mode: str = "reference_weighted_log",
+    target_z: Optional[float] = None,
+    parameter_gp_length_scale: float = 1.0,
+    parameter_gp_noise: float = 1e-3,
 ) -> pd.DataFrame:
     if parameter_cloud is None:
         if str(target_parameter_mode) == "user_supplied":
             raise ValueError("parameter_cloud is required when target_parameter_mode='user_supplied'.")
-        return _weighted_label_stats(label, gene_names, eligible_refs, reference_weights, target_parameter_mode)
+        return _weighted_label_stats(
+            label,
+            gene_names,
+            eligible_refs,
+            reference_weights,
+            target_parameter_mode,
+            target_z=target_z,
+            parameter_gp_length_scale=parameter_gp_length_scale,
+            parameter_gp_noise=parameter_gp_noise,
+        )
 
     if isinstance(parameter_cloud, pd.DataFrame):
         return _normalize_stats_frame(parameter_cloud, gene_names)
@@ -901,6 +1049,9 @@ def _resolve_parameter_cloud(
             eligible_refs=eligible_refs,
             reference_weights=reference_weights,
             target_parameter_mode=target_parameter_mode,
+            target_z=target_z,
+            parameter_gp_length_scale=parameter_gp_length_scale,
+            parameter_gp_noise=parameter_gp_noise,
         )
     if "__default__" in parameter_cloud:
         return _resolve_parameter_cloud(
@@ -910,6 +1061,9 @@ def _resolve_parameter_cloud(
             eligible_refs=eligible_refs,
             reference_weights=reference_weights,
             target_parameter_mode=target_parameter_mode,
+            target_z=target_z,
+            parameter_gp_length_scale=parameter_gp_length_scale,
+            parameter_gp_noise=parameter_gp_noise,
         )
 
     raise TypeError("Unsupported parameter_cloud input for conditional de_novo generation.")
@@ -921,7 +1075,28 @@ def _weighted_label_stats(
     eligible_refs: Sequence[ReferenceSliceData],
     reference_weights: Mapping[str, float],
     target_parameter_mode: str = "reference_weighted_log",
+    target_z: Optional[float] = None,
+    parameter_gp_length_scale: float = 1.0,
+    parameter_gp_noise: float = 1e-3,
 ) -> pd.DataFrame:
+    if str(target_parameter_mode) == "depth_gp_log":
+        gp_stats = _depth_gp_label_stats(
+            label,
+            gene_names,
+            eligible_refs,
+            reference_weights,
+            target_z=target_z,
+            length_scale=parameter_gp_length_scale,
+            noise=parameter_gp_noise,
+        )
+        if gp_stats is not None:
+            return gp_stats
+    effective_parameter_mode = (
+        "reference_weighted_log"
+        if str(target_parameter_mode) == "depth_gp_log"
+        else str(target_parameter_mode)
+    )
+
     if label is None:
         frames = []
         weights = []
@@ -929,17 +1104,114 @@ def _weighted_label_stats(
             for ref_label in ref.labels.values():
                 frames.append(ref_label.stats)
                 weights.append(1.0 / max(len(eligible_refs) * len(ref.labels), 1))
-        if str(target_parameter_mode) == "reference_weighted_log":
+        if effective_parameter_mode == "reference_weighted_log":
             return weighted_stats_log_space(frames, np.asarray(weights, dtype=float), gene_names)
         return _weighted_stats(frames, np.asarray(weights, dtype=float), gene_names)
 
     frames = [ref.labels[label].stats for ref in eligible_refs]
     weights = np.asarray([reference_weights[ref.reference_name] for ref in eligible_refs], dtype=float)
-    if str(target_parameter_mode) == "nearest_reference":
+    if effective_parameter_mode == "nearest_reference":
         return _normalize_stats_frame(frames[int(np.argmax(weights))], gene_names)
-    if str(target_parameter_mode) == "reference_weighted_log":
+    if effective_parameter_mode == "reference_weighted_log":
         return weighted_stats_log_space(frames, weights, gene_names)
     return _weighted_stats(frames, weights, gene_names)
+
+
+def _depth_gp_label_stats(
+    label: Optional[str],
+    gene_names: Sequence[str],
+    eligible_refs: Sequence[ReferenceSliceData],
+    reference_weights: Mapping[str, float],
+    *,
+    target_z: Optional[float],
+    length_scale: float,
+    noise: float,
+) -> Optional[pd.DataFrame]:
+    if target_z is None:
+        return None
+
+    frames: list[pd.DataFrame] = []
+    z_values: list[float] = []
+    quality_weights: list[float] = []
+    for ref in eligible_refs:
+        if label is None:
+            ref_labels = list(ref.labels.values())
+            if not ref_labels:
+                continue
+            ref_frames = [ref_label.stats for ref_label in ref_labels]
+            frame = _weighted_stats(
+                ref_frames,
+                np.full(len(ref_frames), 1.0 / len(ref_frames), dtype=float),
+                gene_names,
+            )
+            z_candidates = [_reference_label_z(ref_label) for ref_label in ref_labels]
+            valid_z = [value for value in z_candidates if value is not None]
+            ref_z = float(np.mean(valid_z)) if valid_z else None
+        else:
+            if label not in ref.labels:
+                continue
+            ref_label = ref.labels[label]
+            frame = ref_label.stats
+            ref_z = _reference_label_z(ref_label)
+        if ref_z is None:
+            return None
+        frames.append(_normalize_stats_frame(frame, gene_names))
+        z_values.append(float(ref_z))
+        quality_weights.append(float(reference_weights.get(ref.reference_name, 0.0)))
+
+    if len(frames) < 2 or len(np.unique(np.asarray(z_values, dtype=float))) < 2:
+        return None
+
+    theta = np.stack([_stats_frame_to_theta(frame, gene_names) for frame in frames], axis=0)
+    weights = np.clip(np.asarray(quality_weights, dtype=np.float64), 0.0, None)
+    if float(weights.sum()) <= 0.0:
+        weights = np.full(len(frames), 1.0 / len(frames), dtype=np.float64)
+    else:
+        weights = weights / float(weights.sum())
+    prior_mean = np.sum(weights[:, None] * theta, axis=0)
+
+    z = np.asarray(z_values, dtype=np.float64)
+    scale = max(float(length_scale), 1e-8)
+    diff = (z[:, None] - z[None, :]) / scale
+    kernel = np.exp(-0.5 * diff * diff)
+    observation_noise = float(noise) / np.clip(weights, 1e-6, None)
+    system = kernel + np.diag(observation_noise)
+    k_star = np.exp(-0.5 * ((z - float(target_z)) / scale) ** 2)
+    try:
+        alpha = np.linalg.solve(system, theta - prior_mean[None, :])
+    except np.linalg.LinAlgError:
+        alpha = np.linalg.pinv(system) @ (theta - prior_mean[None, :])
+    theta_star = prior_mean + k_star @ alpha
+    return _theta_to_stats_frame(theta_star, gene_names)
+
+
+def _reference_label_z(ref_label: ReferenceLabelData) -> Optional[float]:
+    coords = np.asarray(ref_label.coordinates, dtype=float)
+    if coords.ndim != 2 or coords.shape[1] < 3 or coords.shape[0] == 0:
+        return None
+    return float(np.mean(coords[:, 2]))
+
+
+def _stats_frame_to_theta(frame: pd.DataFrame, gene_names: Sequence[str]) -> np.ndarray:
+    aligned = _normalize_stats_frame(frame, gene_names)
+    eps = 1e-8
+    mean = np.log(np.clip(aligned["mean"].to_numpy(dtype=float), eps, None))
+    variance = np.log(np.clip(aligned["variance"].to_numpy(dtype=float), eps, None))
+    zero = logit(np.clip(aligned["zero_prop"].to_numpy(dtype=float), eps, 1.0 - eps))
+    return np.concatenate([mean, variance, zero])
+
+
+def _theta_to_stats_frame(theta: np.ndarray, gene_names: Sequence[str]) -> pd.DataFrame:
+    genes = list(map(str, gene_names))
+    values = np.asarray(theta, dtype=np.float64).reshape(-1)
+    n_genes = len(genes)
+    if values.shape[0] != 3 * n_genes:
+        raise ValueError("theta length does not match gene count.")
+    out = pd.DataFrame(index=genes)
+    out["mean"] = np.clip(np.exp(values[:n_genes]), 1e-8, None)
+    out["variance"] = np.clip(np.exp(values[n_genes : 2 * n_genes]), 1e-8, None)
+    out["zero_prop"] = np.clip(expit(values[2 * n_genes :]), 0.0, 0.99)
+    return out
 
 
 def _weighted_stats(
