@@ -79,6 +79,7 @@ if __name__ == "__main__":
             downsampling_factor=resolution,
             grid_type='hexagonal',
             alpha=0.005,
+            quantile_calibration='reference_rank',
             verbose=True
         )
         
