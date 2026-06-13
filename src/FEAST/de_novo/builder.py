@@ -8,9 +8,16 @@ import numpy as np
 import pandas as pd
 
 from ..FEAST_core.count_decoding import decode_counts_from_quantiles, resolve_decode_method
-from .conditional import VirtualSliceGenerationConfig
+from .conditional import SimulationConfig, _quantile_field_config
 from .core import SliceBlueprint, active_mask_metadata, assign_generated_coordinates, load_blueprint
-from .pattern import compose_gene_pattern, diffuse_quantile_map
+from .pattern import diffuse_quantile_map
+from .quantile_field import (
+    build_latent_program_scores,
+    pattern_spec_to_program_spec,
+    rank_normalize_by_scope,
+    resolve_auto_rank_scope,
+    should_store_quantiles,
+)
 
 
 REQUIRED_STATS_COLUMNS = ("mean", "variance", "zero_prop")
@@ -68,7 +75,7 @@ def _extract_gene_names_from_cloud(parameter_cloud: Union[pd.DataFrame, Mapping[
     if _is_stats_mapping(parameter_cloud):
         raise ValueError(
             "A plain stats mapping requires an explicit gene list. "
-            "Use ParameterCloudBuilder or pass a DataFrame indexed by gene names."
+            "Use SimulationParameterBuilder or pass a DataFrame indexed by gene names."
         )
 
     if _is_serialized_cloud(parameter_cloud):
@@ -153,7 +160,7 @@ def _ensure_design_blueprint(
     return loaded
 
 
-class BlueprintBuilder:
+class SimulationBlueprintBuilder:
     def __init__(
         self,
         coordinates: Sequence[Sequence[float]],
@@ -175,7 +182,7 @@ class BlueprintBuilder:
         self._metadata: Dict[str, Any] = {}
 
     @classmethod
-    def from_coordinates(cls, coordinates: Sequence[Sequence[float]], **kwargs) -> "BlueprintBuilder":
+    def from_coordinates(cls, coordinates: Sequence[Sequence[float]], **kwargs) -> "SimulationBlueprintBuilder":
         return cls(coordinates, **kwargs)
 
     @classmethod
@@ -187,7 +194,7 @@ class BlueprintBuilder:
         spacing: Union[float, Sequence[float]] = 1.0,
         origin: Sequence[float] = (0.0, 0.0),
         technology: Optional[str] = None,
-    ) -> "BlueprintBuilder":
+    ) -> "SimulationBlueprintBuilder":
         if int(n_rows) <= 0 or int(n_cols) <= 0:
             raise ValueError("n_rows and n_cols must be positive.")
         if np.isscalar(spacing):
@@ -211,7 +218,7 @@ class BlueprintBuilder:
         spacing: Union[float, Sequence[float]] = 1.0,
         origin: Sequence[float] = (0.0, 0.0, 0.0),
         technology: Optional[str] = None,
-    ) -> "BlueprintBuilder":
+    ) -> "SimulationBlueprintBuilder":
         if int(n_x) <= 0 or int(n_y) <= 0 or int(n_z) <= 0:
             raise ValueError("n_x, n_y, and n_z must be positive.")
         if np.isscalar(spacing):
@@ -232,7 +239,7 @@ class BlueprintBuilder:
         coords = np.column_stack([xx.ravel(), yy.ravel(), zz.ravel()])
         return cls(coords, coordinate_mode="grid", grid_type="cuboid", technology=technology)
 
-    def set_domains(self, domains: Sequence[Any], *, key: str = "domain") -> "BlueprintBuilder":
+    def set_domains(self, domains: Sequence[Any], *, key: str = "domain") -> "SimulationBlueprintBuilder":
         values = np.asarray(domains)
         if values.shape[0] != self._coordinates.shape[0]:
             raise ValueError("domains must contain one value per spot.")
@@ -241,21 +248,21 @@ class BlueprintBuilder:
             self._obs["domain"] = values.astype(str)
         return self
 
-    def set_mask(self, mask: Sequence[bool]) -> "BlueprintBuilder":
+    def set_mask(self, mask: Sequence[bool]) -> "SimulationBlueprintBuilder":
         values = np.asarray(mask, dtype=bool)
         if values.shape[0] != self._coordinates.shape[0]:
             raise ValueError("mask must contain one value per spot.")
         self._mask = values
         return self
 
-    def set_obs_column(self, key: str, values: Sequence[Any]) -> "BlueprintBuilder":
+    def set_obs_column(self, key: str, values: Sequence[Any]) -> "SimulationBlueprintBuilder":
         arr = np.asarray(values)
         if arr.shape[0] != self._coordinates.shape[0]:
             raise ValueError(f"obs column '{key}' must contain one value per spot.")
         self._obs[str(key)] = arr
         return self
 
-    def set_metadata(self, **metadata: Any) -> "BlueprintBuilder":
+    def set_metadata(self, **metadata: Any) -> "SimulationBlueprintBuilder":
         self._metadata.update(metadata)
         return self
 
@@ -273,17 +280,17 @@ class BlueprintBuilder:
         )
 
 
-class ParameterCloudBuilder:
+class SimulationParameterBuilder:
     def __init__(self, gene_names: Sequence[str]) -> None:
         self._gene_names = _coerce_gene_names(gene_names)
         self._global = pd.DataFrame(index=self._gene_names, columns=list(REQUIRED_STATS_COLUMNS), dtype=float)
         self._label_frames: Dict[str, pd.DataFrame] = {}
 
     @classmethod
-    def from_gene_names(cls, gene_names: Sequence[str]) -> "ParameterCloudBuilder":
+    def from_gene_names(cls, gene_names: Sequence[str]) -> "SimulationParameterBuilder":
         return cls(gene_names)
 
-    def set_all(self, mean: float, variance: float, zero_prop: float) -> "ParameterCloudBuilder":
+    def set_all(self, mean: float, variance: float, zero_prop: float) -> "SimulationParameterBuilder":
         self._global.loc[:, "mean"] = float(mean)
         self._global.loc[:, "variance"] = float(variance)
         self._global.loc[:, "zero_prop"] = float(zero_prop)
@@ -296,7 +303,7 @@ class ParameterCloudBuilder:
         variance: float,
         zero_prop: float,
         label: Optional[str] = None,
-    ) -> "ParameterCloudBuilder":
+    ) -> "SimulationParameterBuilder":
         gene = str(gene_name)
         if gene not in self._gene_names:
             raise KeyError(f"Unknown gene '{gene}'.")
@@ -306,7 +313,7 @@ class ParameterCloudBuilder:
             self._label_frames[str(label)] = frame
         return self
 
-    def set_stats_frame(self, frame: pd.DataFrame, label: Optional[str] = None) -> "ParameterCloudBuilder":
+    def set_stats_frame(self, frame: pd.DataFrame, label: Optional[str] = None) -> "SimulationParameterBuilder":
         normalized = _coerce_stats_frame(frame, self._gene_names)
         if label is None:
             self._global = normalized
@@ -351,26 +358,51 @@ def plot_blueprint(
     return fig, ax
 
 
-def generate_virtual_slice_from_design(
+def simulate_from_design(
     blueprint: Union[SliceBlueprint, ad.AnnData, Mapping[str, Any], str],
     parameter_cloud: Union[pd.DataFrame, Mapping[str, Any]],
     *,
-    config: Optional[VirtualSliceGenerationConfig] = None,
+    config: Optional[SimulationConfig] = None,
     random_seed: int = 0,
     quantiles: Optional[np.ndarray] = None,
     pattern_spec: Optional[Mapping[str, Sequence[Mapping[str, Any]]]] = None,
+    program_spec: Optional[Sequence[Mapping[str, Any]]] = None,
+    gene_loadings: Optional[Any] = None,
     label_key: str = "domain",
 ) -> ad.AnnData:
     original_bp = _ensure_design_blueprint(blueprint, label_key=label_key)
     mask_metadata = active_mask_metadata(original_bp)
     bp = original_bp.active_subset()
-    gen_cfg = config or VirtualSliceGenerationConfig()
+    gen_cfg = config or SimulationConfig()
+    q_cfg = _quantile_field_config(gen_cfg)
     gene_names = _extract_gene_names_from_cloud(parameter_cloud)
     n_spots = bp.n_spots
     n_genes = len(gene_names)
 
-    if quantiles is not None and pattern_spec is not None:
-        raise ValueError("Provide either quantiles or pattern_spec, not both.")
+    if quantiles is not None and (pattern_spec is not None or program_spec is not None or gene_loadings is not None):
+        raise ValueError("Provide either quantiles or latent spatial programs/pattern_spec, not both.")
+    if (program_spec is None) != (gene_loadings is None):
+        raise ValueError("program_spec and gene_loadings must be provided together.")
+
+    quantile_field_mode = str(q_cfg.mode)
+    if quantile_field_mode == "auto":
+        if quantiles is not None:
+            quantile_field_mode = "explicit_quantile"
+        elif program_spec is not None or pattern_spec is not None:
+            quantile_field_mode = "latent_program"
+        else:
+            quantile_field_mode = "iid"
+    if quantile_field_mode not in {"explicit_quantile", "latent_program", "iid"}:
+        raise ValueError(
+            "Design generation supports quantile_field_mode 'auto', "
+            "'explicit_quantile', 'latent_program', or 'iid'."
+        )
+    if quantiles is not None and quantile_field_mode != "explicit_quantile":
+        raise ValueError("quantiles input requires quantile_field_mode='auto' or 'explicit_quantile'.")
+    if quantile_field_mode == "explicit_quantile" and quantiles is None:
+        raise ValueError("explicit_quantile mode requires quantiles.")
+    if quantile_field_mode == "iid" and (pattern_spec is not None or program_spec is not None or gene_loadings is not None):
+        raise ValueError("iid mode cannot be combined with pattern_spec, program_spec, or gene_loadings.")
 
     if quantiles is not None:
         quantiles_arr = np.asarray(quantiles, dtype=np.float32)
@@ -385,20 +417,60 @@ def generate_virtual_slice_from_design(
                 f"got {quantiles_arr.shape}."
             )
         quantiles_arr = np.clip(quantiles_arr, 0.0, 1.0)
+        q_meta = {
+            "requested_rank_scope": str(q_cfg.rank_scope),
+            "resolved_rank_scope": "explicit_quantile",
+            "fallbacks": [],
+        }
+        latent_scores = None
+        program_metadata: Dict[str, Any] = {}
+    elif quantile_field_mode == "latent_program":
+        active_program_spec = program_spec
+        active_gene_loadings = gene_loadings
+        if active_program_spec is None:
+            active_program_spec, active_gene_loadings = pattern_spec_to_program_spec(pattern_spec or {})
+        if not active_program_spec:
+            raise ValueError("latent_program mode requires program_spec/gene_loadings or non-empty pattern_spec.")
+        latent_scores, program_metadata = build_latent_program_scores(
+            bp,
+            gene_names,
+            program_spec=active_program_spec,
+            gene_loadings=active_gene_loadings,
+            label_key=label_key,
+            random_seed=int(random_seed),
+            boundary_softness=float(gen_cfg.boundary_softness),
+            normalization=str(q_cfg.program_normalization),
+            program_noise_scale=float(q_cfg.program_noise_scale),
+        )
+        labels_for_scope = bp.obs[label_key].astype(str).to_numpy()
+        domain_specific = isinstance(parameter_cloud, Mapping) and not _is_stats_mapping(parameter_cloud) and not _is_serialized_cloud(parameter_cloud)
+        resolved_scope = resolve_auto_rank_scope(
+            requested_scope=str(q_cfg.rank_scope),
+            coordinate_dim=int(bp.coordinates.shape[1]),
+            domain_specific=bool(domain_specific),
+            stack_like=bp.coordinates.shape[1] >= 3 and len(np.unique(bp.coordinates[:, 2])) > 1,
+        )
+        quantiles_arr, q_meta = rank_normalize_by_scope(
+            latent_scores,
+            labels=labels_for_scope,
+            coordinates=bp.coordinates,
+            rank_scope=resolved_scope,
+            tie_policy=str(q_cfg.tie_policy),
+            clip_eps=float(q_cfg.latent_clip_eps),
+            random_seed=int(random_seed),
+            tie_jitter_scale=float(q_cfg.tie_jitter_scale),
+            min_rank_scope_size=int(q_cfg.min_rank_scope_size),
+        )
     else:
         rng = np.random.default_rng(int(random_seed))
         quantiles_arr = rng.random((n_spots, n_genes), dtype=np.float32)
-        if pattern_spec is not None:
-            for idx, gene_name in enumerate(gene_names):
-                motifs = pattern_spec.get(str(gene_name), [])
-                if motifs:
-                    quantiles_arr[:, idx] = compose_gene_pattern(
-                        bp,
-                        motifs,
-                        label_key=label_key,
-                        random_seed=int(random_seed) + idx,
-                        boundary_softness=float(gen_cfg.boundary_softness),
-                    ).astype(np.float32, copy=False)
+        latent_scores = None
+        program_metadata = {}
+        q_meta = {
+            "requested_rank_scope": str(q_cfg.rank_scope),
+            "resolved_rank_scope": "iid",
+            "fallbacks": [],
+        }
 
     quantiles_arr = diffuse_quantile_map(
         quantiles_arr,
@@ -448,7 +520,15 @@ def generate_virtual_slice_from_design(
 
     result = ad.AnnData(X=counts, obs=obs, var=var)
     result.layers["counts"] = counts.astype(np.int32, copy=False)
-    result.layers["transported_quantiles"] = quantiles_arr.astype(np.float32, copy=False)
+    store_q = should_store_quantiles(
+        q_cfg.store_quantiles,
+        int(np.prod(quantiles_arr.shape)),
+        int(q_cfg.max_stored_quantile_elements),
+    )
+    if store_q:
+        result.layers["feast_quantiles"] = quantiles_arr.astype(np.float32, copy=False)
+    if q_cfg.store_latent_scores and latent_scores is not None:
+        result.layers["latent_scores"] = latent_scores.astype(np.float32, copy=False)
     result.uns["de_novo"] = {
         "conditional_generation": False,
         "designed_generation": True,
@@ -461,6 +541,25 @@ def generate_virtual_slice_from_design(
         "parameter_cloud_summary": label_cloud_summary,
         "reference_metadata": {"mode": "design", "labels": sorted(np.unique(labels).tolist())},
         "mask": mask_metadata,
+        "quantile_field": {
+            "method_version": "latent_v1" if quantile_field_mode == "latent_program" else str(quantile_field_mode),
+            "mode": quantile_field_mode,
+            "source": "program" if quantile_field_mode == "latent_program" else quantile_field_mode,
+            "requested_rank_scope": str(q_cfg.rank_scope),
+            "resolved_rank_scope": q_meta.get("resolved_rank_scope"),
+            "rank_scope_metadata": q_meta,
+            "tie_policy": str(q_cfg.tie_policy),
+            "latent_clip_eps": float(q_cfg.latent_clip_eps),
+            "tie_jitter_scale": float(q_cfg.tie_jitter_scale),
+            "program_normalization": str(q_cfg.program_normalization),
+            "program_noise_scale": float(q_cfg.program_noise_scale),
+            "programs": program_metadata.get("programs", []),
+            "n_programs": int(program_metadata.get("n_programs", 0)),
+            "store_latent_scores": bool(q_cfg.store_latent_scores),
+            "store_quantiles": q_cfg.store_quantiles,
+            "quantiles_stored": bool(store_q),
+            "random_seed": int(random_seed),
+        },
     }
     assign_generated_coordinates(result, bp.coordinates)
     result.uns["target_blueprint"] = bp.to_dict()
@@ -469,4 +568,6 @@ def generate_virtual_slice_from_design(
             str(gene): [dict(motif) for motif in motifs]
             for gene, motifs in pattern_spec.items()
         }
+    if program_spec is not None:
+        result.uns["de_novo"]["program_spec"] = [dict(program) for program in program_spec]
     return result

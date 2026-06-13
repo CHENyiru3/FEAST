@@ -201,7 +201,7 @@ class GeneParameterSimulator:
             return self.target_stats
         return self.original_stats
 
-    def simulate(self, n_genes, overgeneration_factor=1.1, verbose=True, random_seed=None, return_uniform=False):
+    def simulate(self, n_genes, overgeneration_factor=2.0, verbose=True, random_seed=None, return_uniform=False):
         if not self.fitted: raise RuntimeError("Simulator must be fitted first.")
         n_to_generate = max(int(n_genes), int(n_genes * overgeneration_factor))
         if verbose: print(f"\n--- [SIMULATING] Generating {n_to_generate} synthetic profiles...")
@@ -223,23 +223,42 @@ class GeneParameterSimulator:
             return final_params, uniform_samples
         return final_params
 
-    def assign_to_genes(self, synthetic_df, weights={'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0}, random_seed=42, verbose=True):
-        if verbose: print(f"\n--- [ASSIGNING] Assigning synthetic profiles (seed: {random_seed})...")
+    def assign_to_genes(self, synthetic_df, weights={'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0}, random_seed=42, verbose=True, hybrid_alpha=0.2):
+        """Assign synthetic profiles to genes via optimal transport.
+
+        Uses a hybrid cost with 20% log-space distance and 80% raw z-score distance.
+        hybrid_alpha controls the log-space weight; 0.2 = 20% log, 80% raw (production default).
+        hybrid_alpha=1.0 recovers the old pure log-space cost.
+        """
+        if verbose: print(f"\n--- [ASSIGNING] Assigning synthetic profiles (seed: {random_seed}, hybrid_alpha={hybrid_alpha})...")
         assignment_stats = self._assignment_stats()
         if len(synthetic_df) < len(assignment_stats): raise ValueError("Fewer synthetic profiles than real genes. Increase overgeneration_factor.")
-        
-        synthetic_subset = synthetic_df.sample(n=len(assignment_stats), random_state=random_seed).reset_index(drop=True)
-        scaler = StandardScaler()
-        orig_scaled = scaler.fit_transform(np.log10(assignment_stats.clip(lower=1e-10)))
-        synth_scaled = scaler.transform(np.log10(synthetic_subset.clip(lower=1e-10)))
-        
-        weight_vector = np.array([weights['mean'], weights['variance'], weights['zero_prop']])
-        cost_matrix = cdist(orig_scaled * weight_vector, synth_scaled * weight_vector, 'euclidean')
-        
+
+        # Use ALL overgenerated candidates — do not subsample before OT
+        synthetic_subset = synthetic_df.reset_index(drop=True)
+        w = np.array([weights['mean'], weights['variance'], weights['zero_prop']])
+        eps = 1e-10
+
+        # Log-space cost (captures relative-scale similarity)
+        scaler_log = StandardScaler()
+        orig_log = scaler_log.fit_transform(np.log10(assignment_stats[['mean','variance','zero_prop']].clip(lower=eps)))
+        synth_log = scaler_log.transform(np.log10(synthetic_subset[['mean','variance','zero_prop']].clip(lower=eps)))
+        cost_log = cdist(orig_log * w, synth_log * w, 'euclidean')
+
+        # Raw z-score cost (captures absolute-scale similarity, especially for high-expression genes)
+        scaler_raw = StandardScaler()
+        orig_raw = scaler_raw.fit_transform(assignment_stats[['mean','variance','zero_prop']].clip(lower=0))
+        synth_raw = scaler_raw.transform(synthetic_subset[['mean','variance','zero_prop']].clip(lower=0))
+        cost_raw = cdist(orig_raw * w, synth_raw * w, 'euclidean')
+
+        # Normalize by shared mean so α actually controls the mix
+        norm = max(cost_log.mean(), cost_raw.mean(), eps)
+        cost_matrix = hybrid_alpha * (cost_log / norm) + (1 - hybrid_alpha) * (cost_raw / norm)
+
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         assigned_df = synthetic_subset.iloc[col_ind].reset_index(drop=True)
         assigned_df['gene_id'] = assignment_stats.index[row_ind]
-        
+
         if verbose: print("✓ Assignment complete.")
         return assigned_df[['gene_id', 'mean', 'variance', 'zero_prop']]
 
@@ -259,11 +278,9 @@ class GeneParameterSimulator:
         if len(synthetic_df) < len(self.original_stats):
             raise ValueError("Fewer synthetic profiles than real genes. Increase overgeneration_factor.")
 
-        rng = np.random.default_rng(None if random_seed is None else int(random_seed))
         n_genes = len(self.original_stats)
-        subset_idx = rng.choice(len(synthetic_df), size=n_genes, replace=False)
-        synthetic_subset = synthetic_df.iloc[subset_idx].reset_index(drop=True)
-        sampled_u = np.asarray(synthetic_uniform, dtype=float)[subset_idx, :]
+        synthetic_subset = synthetic_df.reset_index(drop=True)
+        sampled_u = np.asarray(synthetic_uniform, dtype=float)
 
         original_u = pseudo_observations(self.original_stats).to_numpy(dtype=float)
         weight_vector = _assignment_weight_vector(weights)
@@ -280,6 +297,7 @@ class GeneParameterSimulator:
             'max_cost': float(np.max(selected_costs)) if selected_costs.size else 0.0,
             'total_cost': float(np.sum(selected_costs)),
             'n_profiles': int(n_genes),
+            'n_candidates': int(len(synthetic_subset)),
             'weights': {
                 'mean': float(weight_vector[0]),
                 'variance': float(weight_vector[1]),
@@ -296,7 +314,7 @@ class GeneParameterSimulator:
         simulation_mode='generative',
         assignment_weights=None,
         random_seed=None,
-        overgeneration_factor=1.1,
+        overgeneration_factor=2.0,
         verbose=True,
     ):
         """Build the gene-indexed target parameter table for an integrated simulation."""
@@ -332,17 +350,20 @@ class GeneParameterSimulator:
         )
         requested = apply_alteration_to_stats(sampled_params, config)
         projected, feasibility = project_stats_to_feasible_domain(requested)
-        assigned, assignment_diag = self.assign_to_genes_copula_rank(
+        assigned = self.assign_to_genes(
             projected,
-            sampled_u,
-            weights=assignment_weights,
-            random_seed=random_seed,
+            weights=assignment_weights or {'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0},
+            random_seed=random_seed or 42,
             verbose=verbose,
+            hybrid_alpha=getattr(self, 'hybrid_alpha', 0.2),
         )
+        assignment_diag = {'assignment_method': 'hybrid_ot',
+                           'hybrid_alpha': getattr(self, 'hybrid_alpha', 0.2),
+                           'weights': assignment_weights or {'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0}}
         diagnostics = {
             'simulation_mode': 'generative',
             'gene_parameter_engine': 'generative',
-            'assignment_method': 'copula_rank_ot',
+            'assignment_method': 'log10_scaled_ot',
             'requested_config': alteration_config_to_dict(config),
             'target_fold_change': alteration_config_to_dict(config),
             'target_stage_achieved_change': calculate_fold_change(self.original_stats, assigned),
@@ -584,132 +605,210 @@ def _moment_objective_function_log_scale(params, target_stats, model_type):
 # These functions now call the new log-scale objective function.
 # =============================================================================
 
-def _estimate_zip_by_moment_optimization(mu_total, var_total, zero_prop):
-    """Finds ZIP parameters by minimizing the log-scale objective function."""
+def _estimate_zip_by_moment_optimization(mu_total, var_total, zero_prop,
+                                          n_spots=None, boundary=None):
+    """Finds ZIP parameters by minimizing log-scale objective + finite-sample correction."""
     target_stats = np.array([mu_total, var_total, zero_prop])
-    
-    # Sensible initial guesses for the optimizer
+
     initial_pi = np.clip(zero_prop, 0.01, 0.99)
     initial_lambda = max(mu_total / (1 - initial_pi) if (1 - initial_pi) > 1e-8 else mu_total, 1e-8)
     initial_guess = [initial_pi, initial_lambda]
-    
+
     bounds = [(1e-6, 1 - 1e-6), (1e-6, None)]
-    
+
     result = minimize(
-        _moment_objective_function_log_scale,  # <-- Using the new objective function
+        _moment_objective_function_log_scale,
         initial_guess,
         args=(target_stats, 'ZIP'),
         method='L-BFGS-B',
         bounds=bounds,
         options={'maxiter': 5000, 'ftol': 1e-8}
     )
-    
-    # Return result if optimization was successful and error is low
-    if result.success and result.fun < 1e-4:
-        return {'pi0': result.x[0], 'lambda': result.x[1]}
-    else: # Fallback to initial guess if optimization fails
-        # This is normal for interpolated parameters - just use initial guess silently
-        return {'pi0': initial_guess[0], 'lambda': initial_guess[1]}
 
-def _estimate_zinb_by_moment_optimization(mu_total, var_total, zero_prop):
-    """Finds ZINB parameters by minimizing the log-scale objective function."""
+    if result.success and result.fun < 1e-4:
+        pi0, lam = result.x[0], result.x[1]
+    else:
+        pi0, lam = initial_guess[0], initial_guess[1]
+
+    return {'pi0': pi0, 'lambda': lam}
+
+
+def _finite_sample_correct_zip(pi0, lam, target_stats, n_spots, boundary=None):
+    """Adjust ZIP params so realized finite-sample moments match targets."""
+    target_mean, target_var, target_zero = target_stats
+    for _ in range(3):
+        zero_mask = np.random.random(n_spots) < pi0
+        counts = np.random.poisson(lam, size=n_spots)
+        counts[zero_mask] = 0
+        if boundary is not None and np.isfinite(boundary):
+            counts = np.minimum(counts, boundary)
+        eps = 1e-10
+        real_mean, real_var, real_zero = np.mean(counts), np.var(counts), np.mean(counts == 0)
+        if (abs(np.log10(real_mean + eps) - np.log10(target_mean + eps)) < 0.01 and
+            abs(np.log10(real_var + eps) - np.log10(target_var + eps)) < 0.05 and
+            abs(real_zero - target_zero) < 0.02):
+            break
+        if real_mean > 0 and target_mean > 0:
+            lam = max(lam * (target_mean / real_mean), 1e-8)
+        if real_zero < target_zero:
+            pi0 = min(pi0 + 0.05 * (target_zero - real_zero), 0.99)
+        elif real_zero > target_zero:
+            pi0 = max(pi0 - 0.05 * (real_zero - target_zero), 0.0)
+    return pi0, lam
+
+def _estimate_zinb_by_moment_optimization(mu_total, var_total, zero_prop,
+                                           n_spots=None, boundary=None):
+    """Finds ZINB parameters by minimizing log-scale objective + finite-sample correction."""
     target_stats = np.array([mu_total, var_total, zero_prop])
-    
-    # Sensible initial guesses for the optimizer
+
     initial_pi = np.clip(zero_prop, 0.01, 0.99)
     initial_mu = max(mu_total / (1 - initial_pi) if (1 - initial_pi) > 1e-8 else mu_total, 1e-8)
     initial_r = max((initial_mu**2) / (var_total - initial_mu) if var_total > initial_mu else 1.0, 1e-8)
     initial_guess = [initial_pi, initial_mu, initial_r]
 
     bounds = [(1e-6, 1 - 1e-6), (1e-6, None), (1e-6, None)]
-    
+
     result = minimize(
-        _moment_objective_function_log_scale,  # <-- Using the new objective function
+        _moment_objective_function_log_scale,
         initial_guess,
         args=(target_stats, 'ZINB'),
         method='L-BFGS-B',
         bounds=bounds,
         options={'maxiter': 5000, 'ftol': 1e-8}
     )
-    
-    # Return result if optimization was successful and error is low
+
     if result.success and result.fun < 1e-4:
-        return {'pi0': result.x[0], 'mu': result.x[1], 'r': result.x[2]}
-    else: # Fallback to initial guess if optimization fails
-        return {'pi0': initial_guess[0], 'mu': initial_guess[1], 'r': initial_guess[2]}
+        pi0, mu, r = result.x[0], result.x[1], result.x[2]
+    else:
+        pi0, mu, r = initial_guess[0], initial_guess[1], initial_guess[2]
 
-def _select_model_with_heuristic(mu_total, var_total, zero_prop, zero_threshold=0.3, overdispersion_threshold=1.5):
-    """Heuristically selects a count model based on summary statistics.
-    
-    ADJUSTED: overdispersion_threshold lowered from 2.0 to 1.5
-    - For sparse ST data with mean=0.0689, var/mean often < 1.0 (under-dispersed)
-    - Threshold=1.5 catches moderately overdispersed genes while keeping ZIP as default
-    - Reference data shows: mean overdispersion=0.71, so most genes should use ZIP
-    - Only ~3-5% of genes expected to be ZINB/NB with threshold=1.5
+    return {'pi0': pi0, 'mu': mu, 'r': r}
+
+
+def _finite_sample_correct_zinb(pi0, mu, r, target_stats, n_spots, boundary=None):
+    """Adjust ZINB params so realized finite-sample moments match targets."""
+    target_mean, target_var, target_zero = target_stats
+    for _ in range(3):
+        zero_mask = np.random.random(n_spots) < pi0
+        p = r / (r + mu)
+        counts = np.random.negative_binomial(r, np.clip(p, 1e-8, 1 - 1e-8), size=n_spots)
+        counts[zero_mask] = 0
+        if boundary is not None and np.isfinite(boundary):
+            counts = np.minimum(counts, boundary)
+        eps = 1e-10
+        real_mean, real_var, real_zero = np.mean(counts), np.var(counts), np.mean(counts == 0)
+        if (abs(np.log10(real_mean + eps) - np.log10(target_mean + eps)) < 0.01 and
+            abs(np.log10(real_var + eps) - np.log10(target_var + eps)) < 0.05 and
+            abs(real_zero - target_zero) < 0.02):
+            break
+        if real_mean > 0 and target_mean > 0:
+            mu = max(mu * (target_mean / real_mean), 1e-8)
+        if real_var > 0 and target_var > 0:
+            var_ratio = target_var / max(real_var, 1e-8)
+            if var_ratio > 1:
+                r = max(r / var_ratio, 0.1)
+            else:
+                r = r * (2.0 - var_ratio)
+            r = max(r, 1e-8)
+        if real_zero < target_zero:
+            pi0 = min(pi0 + 0.05 * (target_zero - real_zero), 0.99)
+        elif real_zero > target_zero:
+            pi0 = max(pi0 - 0.05 * (real_zero - target_zero), 0.0)
+    return pi0, mu, r
+
+def _select_model_with_heuristic(mu_total, var_total, zero_prop,
+                                 zero_tolerance=0.05, overdispersion_threshold=1.5):
+    """Select count model using excess-zero logic, not raw zero proportion.
+
+    High zero proportion is normal for low-expression genes (Poisson mean=0.2
+    gives 82% zeros). Only flag zero-inflation when observed zeros significantly
+    exceed the expected zeros under the non-inflated model.
     """
-    if mu_total <= 1e-8: return 'Poisson'
-    is_zero_inflated = zero_prop > zero_threshold
-    is_overdispersed = (var_total / mu_total) > overdispersion_threshold
-    
-    if is_zero_inflated and is_overdispersed: return 'ZINB'
-    if is_zero_inflated: return 'ZIP'
-    if is_overdispersed: return 'NB'
-    return 'Poisson'
+    if mu_total <= 1e-8:
+        return 'Poisson'
 
-def _estimate_params_no_fallback(model_name, mu_total, var_total, zero_prop):
+    is_overdispersed = (var_total / mu_total) > overdispersion_threshold
+
+    # Expected zero under Poisson
+    zero_pois = np.exp(-mu_total)
+
+    # Expected zero under NB (moment-matched)
+    if var_total > mu_total:
+        r_nb = mu_total**2 / (var_total - mu_total)
+        zero_nb = (r_nb / (r_nb + mu_total))**r_nb
+    else:
+        zero_nb = zero_pois
+
+    if not is_overdispersed:
+        if zero_prop > zero_pois + zero_tolerance:
+            return 'ZIP'
+        else:
+            return 'Poisson'
+    else:
+        if zero_prop > zero_nb + zero_tolerance:
+            return 'ZINB'
+        else:
+            return 'NB'
+
+def _estimate_params_no_fallback(model_name, mu_total, var_total, zero_prop,
+                                  n_spots=None, boundary=None):
     """Master function to dispatch to the correct moment-matching optimizer."""
     if model_name == 'Poisson':
         return {'lambda': max(mu_total, 1e-8)}
     if model_name == 'NB':
-        # Simple moment matching for non-inflated NB
         r = max((mu_total**2)/(var_total-mu_total), 1e-8) if var_total > mu_total else np.inf
         return {'mu': max(mu_total, 1e-8), 'r': r}
     if model_name == 'ZIP':
-        # Calls the updated ZIP estimator
-        return _estimate_zip_by_moment_optimization(mu_total, var_total, zero_prop)
+        return _estimate_zip_by_moment_optimization(mu_total, var_total, zero_prop,
+                                                     n_spots=n_spots, boundary=boundary)
     if model_name == 'ZINB':
-        # Calls the updated ZINB estimator
-        return _estimate_zinb_by_moment_optimization(mu_total, var_total, zero_prop)
+        return _estimate_zinb_by_moment_optimization(mu_total, var_total, zero_prop,
+                                                      n_spots=n_spots, boundary=boundary)
     return {}
 
-def convert_params_for_new_simulator(stats_df: pd.DataFrame):
+def convert_params_for_new_simulator(stats_df: pd.DataFrame,
+                                     n_spots: int = None,
+                                     boundary_multiplier: float = 1.1):
     """
     Converts a DataFrame of statistics (mean, variance, zero_prop) into
-    parameters for specific count models (ZINB, etc.) using the improved
-    log-scale moment inference method.
+    parameters for specific count models (ZINB, etc.) using improved
+    excess-zero model selection and optional finite-sample moment correction.
+
+    Args:
+        stats_df: gene-level (mean, variance, zero_prop) table
+        n_spots: if provided, enable finite-sample moment correction
+        boundary_multiplier: max count boundary for finite-sample simulation
     """
     if 'gene_id' in stats_df.columns:
         stats_df = stats_df.set_index('gene_id')
     stats_df = stats_df[STAT_COLUMNS].copy()
-    print(f"\n--- [CONVERTING] Converting {len(stats_df)} parameter sets via log-scale moment-matching ---")
-    
+    print(f"\n--- [CONVERTING] Converting {len(stats_df)} parameter sets via excess-zero model selection ---")
+    if n_spots is not None:
+        print(f"  Finite-sample correction enabled (n={n_spots}, boundary={boundary_multiplier}x)")
+
     output_dict = {'genes': {}, 'model_selected': [], 'marginal_param1': []}
-    
-    # Debug: track model selection distribution
     model_counts = {}
     debug_stats = []
-    
+
     for i, (gene_id, record) in enumerate(stats_df.iterrows()):
         record_dict = record.to_dict()
         mu = record_dict['mean']
         var = record_dict['variance']
         zp = record_dict['zero_prop']
-        
-        # Debug: collect stats for analysis
+
         overdispersion = var / mu if mu > 1e-8 else 0
+        zero_pois = np.exp(-mu) if mu > 1e-8 else 1.0
+        excess_zero = zp - zero_pois
         debug_stats.append({
-            'gene': gene_id,
-            'mean': mu,
-            'variance': var,
-            'zero_prop': zp,
-            'overdispersion': overdispersion,
-            'is_zero_inflated': zp > 0.3,
-            'is_overdispersed': overdispersion > 2.0
+            'gene': gene_id, 'mean': mu, 'variance': var, 'zero_prop': zp,
+            'overdispersion': overdispersion, 'excess_zero': excess_zero,
+            'is_overdispersed': overdispersion > 1.5,
         })
-        
-        # Select the best model and estimate its parameters using the new methods
+
         model_type = _select_model_with_heuristic(mu, var, zp)
-        params = _estimate_params_no_fallback(model_type, mu, var, zp)
+        params = _estimate_params_no_fallback(model_type, mu, var, zp,
+                                               n_spots=n_spots,
+                                               boundary=boundary_multiplier)
         
         model_counts[model_type] = model_counts.get(model_type, 0) + 1
         
@@ -730,10 +829,10 @@ def convert_params_for_new_simulator(stats_df: pd.DataFrame):
     # Debug output
     debug_df = pd.DataFrame(debug_stats)
     print(f"  > Model selection summary: {model_counts}")
-    print(f"  > Zero inflation rate: {debug_df['is_zero_inflated'].mean():.2%}")
-    print(f"  > Overdispersion rate: {debug_df['is_overdispersed'].mean():.2%}")
+    print(f"  > Overdispersion rate (var/mu > 1.5): {debug_df['is_overdispersed'].mean():.2%}")
     print(f"  > Mean overdispersion: {debug_df['overdispersion'].mean():.2f}")
     print(f"  > Mean zero proportion: {debug_df['zero_prop'].mean():.3f}")
+    print(f"  > Mean excess zero (obs - Poisson): {debug_df['excess_zero'].mean():.4f}")
         
     print("✓ Conversion complete.")
     return output_dict

@@ -10,6 +10,7 @@ from FEAST.FEAST_core.parameter_cloud import (
     pseudo_observations,
     resolve_simulation_mode,
 )
+from FEAST.FEAST_core.simulator import resolve_quantile_calibration_source
 from FEAST.modeling.marginal_alteration import AlterationConfig
 
 
@@ -29,6 +30,15 @@ def test_resolve_simulation_mode_validation_and_aliases():
     assert resolve_simulation_mode("real_stats") == "empirical"
     with pytest.raises(ValueError, match="simulation_mode"):
         resolve_simulation_mode("bad")
+
+
+def test_resolve_quantile_calibration_source_defaults_and_aliases():
+    assert resolve_quantile_calibration_source(None, "empirical") == "reference_rank"
+    assert resolve_quantile_calibration_source(None, "generative") == "raw"
+    assert resolve_quantile_calibration_source("rank", "generative") == "reference_rank"
+    assert resolve_quantile_calibration_source("iid", "empirical") == "raw"
+    with pytest.raises(ValueError, match="quantile_calibration"):
+        resolve_quantile_calibration_source("bad", "generative")
 
 
 def test_apply_alteration_to_stats_changes_only_selected_columns():
@@ -75,6 +85,28 @@ def test_copula_rank_assignment_uses_pseudo_observation_space():
     assert diagnostics["assignment_method"] == "copula_rank_ot"
     assert sorted(assigned["gene_id"].tolist()) == ["g1", "g2", "g3", "g4"]
     assert diagnostics["mean_cost"] >= 0.0
+
+
+def test_copula_rank_assignment_can_select_from_overgenerated_pool():
+    simulator = GeneParameterSimulator()
+    simulator.original_stats = _stats()
+    synthetic = pd.DataFrame(
+        {
+            "mean": [100.0, 1.0, 2.0, 4.0, 8.0],
+            "variance": [100.0, 2.0, 3.0, 5.0, 9.0],
+            "zero_prop": [0.9, 0.1, 0.2, 0.3, 0.4],
+        }
+    )
+    synthetic_u = pseudo_observations(synthetic).to_numpy()
+    assigned, diagnostics = simulator.assign_to_genes_copula_rank(
+        synthetic,
+        synthetic_u,
+        random_seed=0,
+        verbose=False,
+    )
+    assert diagnostics["n_profiles"] == 4
+    assert diagnostics["n_candidates"] == 5
+    assert sorted(assigned["gene_id"].tolist()) == ["g1", "g2", "g3", "g4"]
 
 
 def test_convert_params_uses_gene_id_column_as_gene_names():

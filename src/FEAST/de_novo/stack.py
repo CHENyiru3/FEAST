@@ -8,10 +8,10 @@ import numpy as np
 import pandas as pd
 
 from .conditional import (
-    ConditionalReferenceConfig,
-    VirtualSliceGenerationConfig,
-    fit_virtual_slice_reference,
-    generate_virtual_slice,
+    ReferenceFitConfig,
+    SimulationConfig,
+    fit_reference,
+    simulate_from_reference,
 )
 from .core import SliceBlueprint, assign_generated_coordinates, load_blueprint
 
@@ -27,10 +27,10 @@ def simulate_stack(
     *,
     label_key: str = "domain",
     parameter_cloud: Optional[Union[pd.DataFrame, Mapping[str, Any]]] = None,
-    config: Optional[VirtualSliceGenerationConfig] = None,
+    config: Optional[SimulationConfig] = None,
     random_seed: int = 0,
 ) -> Dict[float, ad.AnnData]:
-    gen_cfg = config or VirtualSliceGenerationConfig()
+    gen_cfg = config or SimulationConfig()
     references = _coerce_reference_slices(reference_slices)
     reference_z = _coerce_numeric_sequence(reference_z_values, "reference_z_values")
     target_z = _coerce_numeric_sequence(target_z_values, "target_z_values")
@@ -78,13 +78,13 @@ def simulate_stack(
         if cache_key not in model_cache:
             lower_ref = _reference_with_explicit_z(references_sorted[lower_idx], z0, lower_idx)
             upper_ref = _reference_with_explicit_z(references_sorted[upper_idx], z1, upper_idx)
-            fit_cfg = ConditionalReferenceConfig(
+            fit_cfg = ReferenceFitConfig(
                 min_gene_spots=1,
                 min_gene_mean=0.0,
                 max_gene_zero_prop=1.0,
                 coordinate_scale=gen_cfg.coordinate_scale,
             )
-            model_cache[cache_key] = fit_virtual_slice_reference(
+            model_cache[cache_key] = fit_reference(
                 [lower_ref, upper_ref],
                 label_key,
                 fit_cfg,
@@ -95,7 +95,7 @@ def simulate_stack(
             model.references[1].reference_name: float(tau),
         }
 
-        result = generate_virtual_slice(
+        result = simulate_from_reference(
             model,
             target_blueprint,
             parameter_cloud=parameter_cloud,

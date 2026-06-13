@@ -43,7 +43,8 @@ def test_conditional_reference_generation_smoke():
     assert list(result.var_names) == ["g1", "g2", "g3"]
     assert "spatial" in result.obsm
     assert "counts" in result.layers
-    assert "transported_quantiles" in result.layers
+    assert "feast_quantiles" in result.layers
+    assert "transported_quantiles" not in result.layers
     assert np.issubdtype(result.X.dtype, np.integer)
     assert np.all(result.X >= 0)
     assert result.uns["de_novo"]["conditional_generation"] is True

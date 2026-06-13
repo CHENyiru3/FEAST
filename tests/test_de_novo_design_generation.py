@@ -31,7 +31,8 @@ def test_simulate_from_design_smoke():
     assert "spatial" in result.obsm
     assert result.obsm["spatial"].shape == (4, 2)
     assert "counts" in result.layers
-    assert "transported_quantiles" in result.layers
+    assert "feast_quantiles" in result.layers
+    assert "transported_quantiles" not in result.layers
     assert np.issubdtype(result.X.dtype, np.integer)
     assert np.all(result.X >= 0)
     assert result.uns["de_novo"]["designed_generation"] is True
@@ -49,4 +50,5 @@ def test_simulate_from_design_quantile_input():
         random_seed=3,
     )
     assert result.shape == (4, 2)
-    np.testing.assert_allclose(result.layers["transported_quantiles"], quantiles)
+    np.testing.assert_allclose(result.layers["feast_quantiles"], quantiles)
+    assert "transported_quantiles" not in result.layers

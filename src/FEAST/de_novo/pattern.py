@@ -251,7 +251,7 @@ def _diffuse_pattern(coords: np.ndarray, motif: Mapping[str, Any], rng: np.rando
     return _normalize_map(values)
 
 
-def evaluate_spatial_motif(
+def evaluate_motif(
     blueprint: Union[SliceBlueprint, ad.AnnData, Mapping[str, Any], str],
     motif: Mapping[str, Any],
     *,
@@ -292,7 +292,7 @@ def evaluate_spatial_motif(
     return values
 
 
-def compose_gene_pattern(
+def compose_pattern(
     blueprint: Union[SliceBlueprint, ad.AnnData, Mapping[str, Any], str],
     motifs: Sequence[Mapping[str, Any]],
     *,
@@ -303,7 +303,7 @@ def compose_gene_pattern(
     bp = _ensure_pattern_blueprint(blueprint, label_key=label_key)
     combined = np.zeros(bp.n_spots, dtype=float)
     for idx, motif in enumerate(motifs):
-        combined += evaluate_spatial_motif(
+        combined += evaluate_motif(
             bp,
             motif,
             label_key=label_key,
@@ -313,16 +313,16 @@ def compose_gene_pattern(
     return np.clip(combined, 0.0, 1.0)
 
 
-class SpatialPatternBuilder:
+class SimulationPatternBuilder:
     def __init__(self, gene_names: Sequence[str]) -> None:
         self._gene_names = _coerce_gene_names(gene_names)
         self._patterns: Dict[str, list[Dict[str, Any]]] = {gene: [] for gene in self._gene_names}
 
     @classmethod
-    def from_gene_names(cls, gene_names: Sequence[str]) -> "SpatialPatternBuilder":
+    def from_gene_names(cls, gene_names: Sequence[str]) -> "SimulationPatternBuilder":
         return cls(gene_names)
 
-    def add_motif(self, gene_name: str, kind: str, **kwargs: Any) -> "SpatialPatternBuilder":
+    def add_motif(self, gene_name: str, kind: str, **kwargs: Any) -> "SimulationPatternBuilder":
         gene = str(gene_name)
         if gene not in self._patterns:
             raise KeyError(f"Unknown gene '{gene}'.")
@@ -333,29 +333,29 @@ class SpatialPatternBuilder:
         self._patterns[gene].append(motif)
         return self
 
-    def layered(self, gene_name: str, **kwargs: Any) -> "SpatialPatternBuilder":
+    def layered(self, gene_name: str, **kwargs: Any) -> "SimulationPatternBuilder":
         return self.add_motif(gene_name, "layered", **kwargs)
 
-    def gradient(self, gene_name: str, **kwargs: Any) -> "SpatialPatternBuilder":
+    def gradient(self, gene_name: str, **kwargs: Any) -> "SimulationPatternBuilder":
         return self.add_motif(gene_name, "gradient", **kwargs)
 
-    def hotspot(self, gene_name: str, **kwargs: Any) -> "SpatialPatternBuilder":
+    def hotspot(self, gene_name: str, **kwargs: Any) -> "SimulationPatternBuilder":
         return self.add_motif(gene_name, "hotspot", **kwargs)
 
-    def ring(self, gene_name: str, **kwargs: Any) -> "SpatialPatternBuilder":
+    def ring(self, gene_name: str, **kwargs: Any) -> "SimulationPatternBuilder":
         return self.add_motif(gene_name, "ring", **kwargs)
 
-    def clustered(self, gene_name: str, **kwargs: Any) -> "SpatialPatternBuilder":
+    def clustered(self, gene_name: str, **kwargs: Any) -> "SimulationPatternBuilder":
         return self.add_motif(gene_name, "clustered", **kwargs)
 
-    def diffuse(self, gene_name: str, **kwargs: Any) -> "SpatialPatternBuilder":
+    def diffuse(self, gene_name: str, **kwargs: Any) -> "SimulationPatternBuilder":
         return self.add_motif(gene_name, "diffuse", **kwargs)
 
     def build(self) -> Dict[str, list[Dict[str, Any]]]:
         return {gene: [dict(motif) for motif in motifs] for gene, motifs in self._patterns.items() if motifs}
 
 
-def plot_gene_pattern(
+def plot_pattern(
     blueprint: Union[SliceBlueprint, ad.AnnData, Mapping[str, Any], str],
     pattern_spec: Mapping[str, Sequence[Mapping[str, Any]]],
     gene_name: str,
@@ -372,7 +372,7 @@ def plot_gene_pattern(
     fig = None
     if ax is None:
         fig, ax = plt.subplots(figsize=(4.5, 4.5), constrained_layout=True)
-    pattern = compose_gene_pattern(
+    pattern = compose_pattern(
         bp,
         pattern_spec.get(str(gene_name), []),
         label_key=label_key,
@@ -404,7 +404,7 @@ def plot_pattern_panel(
     axes = np.atleast_1d(axes)
     sca = None
     for idx, (ax, gene) in enumerate(zip(axes, genes)):
-        _, _, sca = plot_gene_pattern(
+        _, _, sca = plot_pattern(
             blueprint,
             pattern_spec,
             gene,

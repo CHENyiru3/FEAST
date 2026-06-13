@@ -131,7 +131,15 @@ virtual_slice = de_novo.simulate_from_design(
     pattern_spec=patterns,
     random_seed=7,
 )
+
+# Final rank-normalized quantiles are available when storage is enabled.
+quantiles = virtual_slice.layers["feast_quantiles"]
 ```
+
+De novo generation builds a latent rank-score field from shared spatial motifs,
+rank-normalizes that field into `feast_quantiles`, and decodes counts with the
+target parameter cloud. Reference-conditioned virtual slices use the same
+latent H-to-Q path after transporting reference rank evidence.
 
 ##  Tutorials
 
@@ -161,6 +169,7 @@ FEAST/
 ├── de_novo/             # Blueprint and conditional virtual-slice generation
 │   ├── builder.py
 │   ├── conditional.py
+│   ├── quantile_field.py
 │   └── pattern.py
 └── modeling/            # Statistical models
     ├── StudentT_mixture_model.py

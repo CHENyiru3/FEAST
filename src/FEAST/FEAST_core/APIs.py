@@ -5,15 +5,13 @@ import warnings
 
 import anndata as ad
 
-from .simulator import SpatialSimulator, simulate_single_slice
+from .simulator import simulate_single_slice
 from ..alignment.alignment_simulator import (
-    AlignmentSimulator,
     generate_alignment_benchmark_suite,
     simulate_alignment_rotation,
     simulate_alignment_warp,
 )
 from ..deconvolution.deconvolution_simulator import (
-    DeconvolutionSimulator,
     create_deconvolution_benchmark_suite,
     simulate_deconvolution_from_single_cells,
 )
@@ -39,33 +37,11 @@ class FEAST:
             if self.verbose:
                 print(f"FEAST initialized with single slice: {adata.shape}")
 
-        self._core_simulator = None
-        self._alignment_simulator = None
-        self._deconvolution_simulator = None
-
     def _single_adata(self, context: str) -> ad.AnnData:
         if self.is_multi_slice:
             warnings.warn(f"{context} with multi-slice input. Using first slice.")
             return self.adata_list[0]
         return self.adata
-
-    def _get_core_simulator(self) -> SpatialSimulator:
-        if self._core_simulator is None:
-            self._core_simulator = SpatialSimulator(self._single_adata("Core simulation"))
-        return self._core_simulator
-
-    def _get_alignment_simulator(self) -> AlignmentSimulator:
-        if self._alignment_simulator is None:
-            self._alignment_simulator = AlignmentSimulator(
-                self._single_adata("Alignment simulation"),
-                verbose=self.verbose,
-            )
-        return self._alignment_simulator
-
-    def _get_deconvolution_simulator(self) -> DeconvolutionSimulator:
-        if self._deconvolution_simulator is None:
-            self._deconvolution_simulator = DeconvolutionSimulator(verbose=self.verbose)
-        return self._deconvolution_simulator
 
     def simulate_single_slice(
         self,
@@ -84,6 +60,7 @@ class FEAST:
         alteration_config: Optional[Any] = None,
         boundary_multiplier: float = 1.1,
         simulation_mode: str = "generative",
+        quantile_calibration: Optional[str] = None,
         random_seed: Optional[int] = None,
     ) -> ad.AnnData:
         if verbose is None:
@@ -105,6 +82,7 @@ class FEAST:
             alteration_config=alteration_config,
             boundary_multiplier=boundary_multiplier,
             simulation_mode=simulation_mode,
+            quantile_calibration=quantile_calibration,
             random_seed=random_seed,
         )
 
@@ -139,6 +117,7 @@ class FEAST:
         alteration_config: Optional[Any] = None,
         boundary_multiplier: float = 1.1,
         simulation_mode: str = "generative",
+        quantile_calibration: Optional[str] = None,
         random_seed: Optional[int] = None,
         verbose: Optional[bool] = None,
     ) -> tuple:
@@ -160,6 +139,7 @@ class FEAST:
             "alteration_config": alteration_config,
             "boundary_multiplier": boundary_multiplier,
             "simulation_mode": simulation_mode,
+            "quantile_calibration": quantile_calibration,
             "random_seed": random_seed,
             "verbose": verbose,
         }
