@@ -1,0 +1,32 @@
+{
+  "density_gap": 3,
+  "density_name": "dense_gap3",
+  "generated_h5ad": "generated_z_regularized.h5ad",
+  "label_support_labels": [
+    "15 HY Gnrh1 Glut",
+    "19 MB Glut",
+    "20 MB GABA",
+    "24 MY Glut"
+  ],
+  "lower_ref_slice": 10,
+  "mean_corr": 0.9860494439847395,
+  "median_gene_pearson": 0.09375755004653086,
+  "median_gene_spearman": 0.09003664482085583,
+  "moran_corr": 0.7554441263443725,
+  "n_genes": 1122,
+  "n_label_support_records": 4,
+  "n_spots": 7644,
+  "per_class_metrics_csv": "per_class_metrics_z_regularized.csv",
+  "per_gene_metrics_csv": "per_gene_metrics_z_regularized.csv",
+  "random_seed": 32028,
+  "ref_z_gap": 0.13968198279378197,
+  "target_slice": 11,
+  "target_z": 0.6198209509757062,
+  "tau": 0.4994584491438181,
+  "upper_ref_slice": 12,
+  "var_corr": 0.9592240251706005,
+  "z0": 0.5500556044761904,
+  "z1": 0.6897375872699724,
+  "z_regularized": true,
+  "zero_ks": 0.0784313725490196
+}

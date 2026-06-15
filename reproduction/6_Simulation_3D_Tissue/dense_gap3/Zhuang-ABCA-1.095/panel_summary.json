@@ -1,0 +1,28 @@
+{
+  "density_gap": 3,
+  "density_name": "dense_gap3",
+  "generated_h5ad": "generated.h5ad",
+  "label_support_labels": [
+    "11 CNU-HYa GABA"
+  ],
+  "lower_ref_slice": 93,
+  "mean_corr": 0.9662905263234651,
+  "median_gene_pearson": 0.19674424519099556,
+  "median_gene_spearman": 0.16772821370302987,
+  "moran_corr": 0.7371673852677831,
+  "n_genes": 1122,
+  "n_label_support_records": 1,
+  "n_spots": 24466,
+  "per_class_metrics_csv": "per_class_metrics.csv",
+  "per_gene_metrics_csv": "per_gene_metrics.csv",
+  "random_seed": 32056,
+  "ref_z_gap": 0.2830765990759829,
+  "target_slice": 95,
+  "target_z": 8.363945304623604,
+  "tau": 0.6288040228950216,
+  "upper_ref_slice": 96,
+  "var_corr": 0.9782445048454352,
+  "z0": 8.185945600337185,
+  "z1": 8.469022199413168,
+  "zero_ks": 0.09358288770053476
+}

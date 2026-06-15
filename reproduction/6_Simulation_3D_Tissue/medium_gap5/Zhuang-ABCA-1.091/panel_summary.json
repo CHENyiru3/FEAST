@@ -1,0 +1,28 @@
+{
+  "density_gap": 5,
+  "density_name": "medium_gap5",
+  "generated_h5ad": "generated.h5ad",
+  "label_support_labels": [
+    "17 MH-LH Glut"
+  ],
+  "lower_ref_slice": 89,
+  "mean_corr": 0.9650678959014526,
+  "median_gene_pearson": 0.17288370960429633,
+  "median_gene_spearman": 0.15006637900086575,
+  "moran_corr": 0.7197101140205259,
+  "n_genes": 1122,
+  "n_label_support_records": 1,
+  "n_spots": 26059,
+  "per_class_metrics_csv": "per_class_metrics.csv",
+  "per_gene_metrics_csv": "per_gene_metrics.csv",
+  "random_seed": 52043,
+  "ref_z_gap": 0.35641541343216154,
+  "target_slice": 91,
+  "target_z": 8.008105978096916,
+  "tau": 0.5010327400610078,
+  "upper_ref_slice": 93,
+  "var_corr": 0.9777289778272018,
+  "z0": 7.829530186905023,
+  "z1": 8.185945600337185,
+  "zero_ks": 0.06951871657754011
+}

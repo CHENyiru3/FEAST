@@ -1,0 +1,32 @@
+{
+  "density_gap": 5,
+  "density_name": "medium_gap5",
+  "generated_h5ad": "generated.h5ad",
+  "label_support_labels": [
+    "08 CNU-MGE GABA",
+    "15 HY Gnrh1 Glut",
+    "19 MB Glut",
+    "24 MY Glut",
+    "29 CB Glut"
+  ],
+  "lower_ref_slice": 19,
+  "mean_corr": 0.9743417794435956,
+  "median_gene_pearson": 0.08507115529778754,
+  "median_gene_spearman": 0.08406277166884109,
+  "moran_corr": 0.7777946352998872,
+  "n_genes": 1122,
+  "n_label_support_records": 5,
+  "n_spots": 11309,
+  "per_class_metrics_csv": "per_class_metrics.csv",
+  "per_gene_metrics_csv": "per_gene_metrics.csv",
+  "random_seed": 52029,
+  "ref_z_gap": 0.3109029170921045,
+  "target_slice": 21,
+  "target_z": 1.3389267592772198,
+  "tau": 0.4663824924846593,
+  "upper_ref_slice": 23,
+  "var_corr": 0.9717932645274001,
+  "z0": 1.1939270818830527,
+  "z1": 1.5048299989751572,
+  "zero_ks": 0.17557932263814616
+}

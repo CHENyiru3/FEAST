@@ -1,0 +1,30 @@
+{
+  "density_gap": 10,
+  "density_name": "sparse_gap10",
+  "generated_h5ad": "generated_z_regularized.h5ad",
+  "label_support_labels": [
+    "09 CNU-LGE GABA",
+    "10 LSX GABA"
+  ],
+  "lower_ref_slice": 111,
+  "mean_corr": 0.9805378278508573,
+  "median_gene_pearson": 0.07689484664232882,
+  "median_gene_spearman": 0.07425266501135616,
+  "moran_corr": 0.6907627318748858,
+  "n_genes": 1122,
+  "n_label_support_records": 2,
+  "n_spots": 19003,
+  "per_class_metrics_csv": "per_class_metrics_z_regularized.csv",
+  "per_gene_metrics_csv": "per_gene_metrics_z_regularized.csv",
+  "random_seed": 102037,
+  "ref_z_gap": 0.8548286496096047,
+  "target_slice": 116,
+  "target_z": 10.354266571312971,
+  "tau": 0.5926219760859955,
+  "upper_ref_slice": 121,
+  "var_corr": 0.949022398548588,
+  "z0": 9.847676327766404,
+  "z1": 10.702504977376009,
+  "z_regularized": true,
+  "zero_ks": 0.24777183600713013
+}

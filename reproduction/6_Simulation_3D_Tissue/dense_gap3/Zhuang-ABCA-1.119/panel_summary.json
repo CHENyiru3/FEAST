@@ -1,0 +1,30 @@
+{
+  "density_gap": 3,
+  "density_name": "dense_gap3",
+  "generated_h5ad": "generated.h5ad",
+  "label_support_labels": [
+    "06 CTX-CGE GABA",
+    "09 CNU-LGE GABA",
+    "25 Pineal Glut"
+  ],
+  "lower_ref_slice": 118,
+  "mean_corr": 0.9615751063471569,
+  "median_gene_pearson": 0.11855479801062063,
+  "median_gene_spearman": 0.10310849081663795,
+  "moran_corr": 0.7005077900270404,
+  "n_genes": 1122,
+  "n_label_support_records": 3,
+  "n_spots": 24225,
+  "per_class_metrics_csv": "per_class_metrics.csv",
+  "per_gene_metrics_csv": "per_gene_metrics.csv",
+  "random_seed": 32064,
+  "ref_z_gap": 0.1379800698981768,
+  "target_slice": 119,
+  "target_z": 10.566925187964772,
+  "tau": 0.52064187996462,
+  "upper_ref_slice": 120,
+  "var_corr": 0.8257097144039641,
+  "z0": 10.495086984975336,
+  "z1": 10.633067054873512,
+  "zero_ks": 0.06506238859180036
+}

@@ -1,0 +1,28 @@
+{
+  "density_gap": 3,
+  "density_name": "dense_gap3",
+  "generated_h5ad": "generated.h5ad",
+  "label_support_labels": [
+    "07 CTX-MGE GABA"
+  ],
+  "lower_ref_slice": 4,
+  "mean_corr": 0.995360638231199,
+  "median_gene_pearson": 0.1071370800011455,
+  "median_gene_spearman": 0.10418823074817432,
+  "moran_corr": 0.7194235329569147,
+  "n_genes": 1122,
+  "n_label_support_records": 1,
+  "n_spots": 12097,
+  "per_class_metrics_csv": "per_class_metrics.csv",
+  "per_gene_metrics_csv": "per_gene_metrics.csv",
+  "random_seed": 32026,
+  "ref_z_gap": 0.199997,
+  "target_slice": 5,
+  "target_z": 0.1,
+  "tau": 0.49999249988749833,
+  "upper_ref_slice": 6,
+  "var_corr": 0.964179122353525,
+  "z0": 3e-06,
+  "z1": 0.2,
+  "zero_ks": 0.11764705882352941
+}

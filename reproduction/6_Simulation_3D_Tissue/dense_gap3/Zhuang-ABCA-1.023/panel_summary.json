@@ -1,0 +1,28 @@
+{
+  "density_gap": 3,
+  "density_name": "dense_gap3",
+  "generated_h5ad": "generated.h5ad",
+  "label_support_labels": [
+    "01 IT-ET Glut"
+  ],
+  "lower_ref_slice": 22,
+  "mean_corr": 0.9933966697500082,
+  "median_gene_pearson": 0.11076572944548302,
+  "median_gene_spearman": 0.10380368724124381,
+  "moran_corr": 0.7590550699950799,
+  "n_genes": 1122,
+  "n_label_support_records": 1,
+  "n_spots": 8844,
+  "per_class_metrics_csv": "per_class_metrics.csv",
+  "per_gene_metrics_csv": "per_gene_metrics.csv",
+  "random_seed": 32032,
+  "ref_z_gap": 0.29862611104281767,
+  "target_slice": 23,
+  "target_z": 1.5048299989751572,
+  "tau": 0.3202643048773214,
+  "upper_ref_slice": 24,
+  "var_corr": 0.9852836418500811,
+  "z0": 1.4091907151038114,
+  "z1": 1.707816826146629,
+  "zero_ks": 0.054367201426024955
+}

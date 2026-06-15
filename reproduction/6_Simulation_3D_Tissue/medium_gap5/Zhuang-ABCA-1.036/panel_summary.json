@@ -1,0 +1,28 @@
+{
+  "density_gap": 5,
+  "density_name": "medium_gap5",
+  "generated_h5ad": "generated.h5ad",
+  "label_support_labels": [
+    "15 HY Gnrh1 Glut"
+  ],
+  "lower_ref_slice": 34,
+  "mean_corr": 0.991003990212582,
+  "median_gene_pearson": 0.17803466750978922,
+  "median_gene_spearman": 0.1644575527762075,
+  "moran_corr": 0.7506040486344738,
+  "n_genes": 1122,
+  "n_label_support_records": 1,
+  "n_spots": 9533,
+  "per_class_metrics_csv": "per_class_metrics.csv",
+  "per_gene_metrics_csv": "per_gene_metrics.csv",
+  "random_seed": 52032,
+  "ref_z_gap": 0.4094656323114325,
+  "target_slice": 36,
+  "target_z": 2.760884455979676,
+  "tau": 0.4996284082330883,
+  "upper_ref_slice": 38,
+  "var_corr": 0.9661068169553817,
+  "z0": 2.55630379388176,
+  "z1": 2.9657694261931926,
+  "zero_ks": 0.031194295900178252
+}

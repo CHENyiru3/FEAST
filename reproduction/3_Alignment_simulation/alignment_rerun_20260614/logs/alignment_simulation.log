@@ -1,0 +1,116 @@
+Loading reference: /maiziezhou_lab2/yiru/Reproduce/Experiments/Figure2/alignment/data/151675.h5ad
+  Raw: 3565 spots, 18641 genes
+  After min_cells=30 filter: 3565 spots, 13712 genes
+
+Generating original simulated expression (seed=2026) ...
+Starting comprehensive single slice simulation...
+--- RUNNING IN STANDARD DETERMINISTIC MODE ---
+
+>>> Entering STANDARD fitting pipeline: parameter_cloud <<<
+✓ Using optimal models: Student's T for mean, Student's T for variance, Beta for zero_prop.
+
+--- [FITTING STATS ONLY] Calculating original gene statistics ---
+✓ Statistics calculated.
+
+--- [FITTING MODELS] Fitting marginal and dependency models ---
+Fitting Student's T mixture models (1-15 components)...
+✓ Best model: 11 components (BIC: 21887.35)
+Fitting Student's T mixture models (1-15 components)...
+✓ Best model: 10 components (BIC: 23750.12)
+Fitting Beta mixture models with 1-8 components...
+  1 components: BIC=-23234.87, LogLik=11626.96
+  2 components: BIC=-29449.34, LogLik=14748.49
+  3 components: BIC=-30581.40, LogLik=15328.81
+  4 components: BIC=-30834.50, LogLik=15469.64
+  5 components: BIC=-30990.77, LogLik=15562.07
+  6 components: BIC=-31007.26, LogLik=15584.60
+  7 components: BIC=-30983.92, LogLik=15587.22
+  8 components: BIC=-30955.04, LogLik=15587.07
+✓ Best model: 6 components (BIC=-31007.26)
+
+--- Fitting Dependency Model (Vine Copula) ---
+  > Vine copula structure and parameters selected via BIC.
+
+✓ Simulator has been successfully fitted to the data.
+
+--- [SIMULATING] Generating 27424 synthetic profiles...
+  > Enforcing minimum target parameter boundaries...
+✓ Simulation complete.
+
+--- [ASSIGNING] Assigning synthetic profiles (seed: 2026, hybrid_alpha=0.2)...
+✓ Assignment complete.
+
+--- [CONVERTING] Converting 13712 parameter sets via excess-zero model selection ---
+  Finite-sample correction enabled (n=3565, boundary=1.1x)
+  > Model selection summary: {'ZIP': 13342, 'NB': 364, 'Poisson': 6}
+  > Overdispersion rate (var/mu > 1.5): 2.65%
+  > Mean overdispersion: 0.12
+  > Mean zero proportion: 0.868
+  > Mean excess zero (obs - Poisson): 0.8260
+✓ Conversion complete.
+>>> Exiting parameter_cloud pipeline <<<
+
+Generating simulated data with quantile count decoding...
+Quantile simulation complete for 3565 spots and 13712 genes
+
+Simulation completed successfully!
+  Original: 3565 spots, 13712 genes (599.6s)
+  Saved: reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/original.h5ad
+
+Rotating by 1 degrees ...
+Transforming imaging-based data with 3565 spots
+Rotating spots by 1.0 degrees
+Filtering spots to keep only those within original bounds
+Keeping 3549 of 3565 spots within bounds
+Creating new AnnData with 3549 spots
+  Rotated: 3549 spots (0.0s)
+  Saved: reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/rotated_1.h5ad
+
+Rotating by 5 degrees ...
+Transforming imaging-based data with 3565 spots
+Rotating spots by 5.0 degrees
+Filtering spots to keep only those within original bounds
+Keeping 3410 of 3565 spots within bounds
+Creating new AnnData with 3410 spots
+  Rotated: 3410 spots (0.0s)
+  Saved: reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/rotated_5.h5ad
+
+Rotating by 10 degrees ...
+Transforming imaging-based data with 3565 spots
+Rotating spots by 10.0 degrees
+Filtering spots to keep only those within original bounds
+Keeping 2892 of 3565 spots within bounds
+Creating new AnnData with 2892 spots
+  Rotated: 2892 spots (0.0s)
+  Saved: reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/rotated_10.h5ad
+
+Rotating by 30 degrees ...
+Transforming imaging-based data with 3565 spots
+Rotating spots by 30.0 degrees
+Filtering spots to keep only those within original bounds
+Keeping 1179 of 3565 spots within bounds
+Creating new AnnData with 1179 spots
+  Rotated: 1179 spots (0.0s)
+  Saved: reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/rotated_30.h5ad
+
+Rotating by 45 degrees ...
+Transforming imaging-based data with 3565 spots
+Rotating spots by 45.0 degrees
+Filtering spots to keep only those within original bounds
+Keeping 333 of 3565 spots within bounds
+Creating new AnnData with 333 spots
+  Rotated: 333 spots (0.0s)
+  Saved: reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/rotated_45.h5ad
+
+Rotating by 60 degrees ...
+Transforming imaging-based data with 3565 spots
+Rotating spots by 60.0 degrees
+Filtering spots to keep only those within original bounds
+Keeping 0 of 3565 spots within bounds
+Creating new AnnData with 0 spots
+  Rotated: 0 spots (0.0s)
+  Saved: reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/rotated_60.h5ad
+
+Manifest written: reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulation_manifest.csv (7 rows)
+
+Done.

@@ -1,0 +1,30 @@
+{
+  "density_gap": 5,
+  "density_name": "medium_gap5",
+  "generated_h5ad": "generated_z_regularized.h5ad",
+  "label_support_labels": [
+    "12 HY GABA",
+    "25 Pineal Glut"
+  ],
+  "lower_ref_slice": 44,
+  "mean_corr": 0.9820924042236376,
+  "median_gene_pearson": 0.18707029318567053,
+  "median_gene_spearman": 0.16615728577219005,
+  "moran_corr": 0.8068686562141809,
+  "n_genes": 1122,
+  "n_label_support_records": 2,
+  "n_spots": 21795,
+  "per_class_metrics_csv": "per_class_metrics_z_regularized.csv",
+  "per_gene_metrics_csv": "per_gene_metrics_z_regularized.csv",
+  "random_seed": 52034,
+  "ref_z_gap": 0.38752385875419826,
+  "target_slice": 46,
+  "target_z": 3.7842382240187393,
+  "tau": 0.4975133349851606,
+  "upper_ref_slice": 48,
+  "var_corr": 0.9615985930267981,
+  "z0": 3.59143993666362,
+  "z1": 3.978963795417818,
+  "z_regularized": true,
+  "zero_ks": 0.16042780748663102
+}

@@ -1,0 +1,30 @@
+{
+  "density_gap": 3,
+  "density_name": "dense_gap3",
+  "generated_h5ad": "generated.h5ad",
+  "label_support_labels": [
+    "01 IT-ET Glut",
+    "10 LSX GABA",
+    "25 Pineal Glut"
+  ],
+  "lower_ref_slice": 124,
+  "mean_corr": 0.9554503801210611,
+  "median_gene_pearson": 0.11857175672787279,
+  "median_gene_spearman": 0.09690605227755109,
+  "moran_corr": 0.7656531105238515,
+  "n_genes": 1122,
+  "n_label_support_records": 3,
+  "n_spots": 20340,
+  "per_class_metrics_csv": "per_class_metrics.csv",
+  "per_gene_metrics_csv": "per_gene_metrics.csv",
+  "random_seed": 32066,
+  "ref_z_gap": 0.16086832087077063,
+  "target_slice": 125,
+  "target_z": 10.975185238505748,
+  "tau": 0.4243354903501737,
+  "upper_ref_slice": 126,
+  "var_corr": 0.9250305728869771,
+  "z0": 10.90692310068724,
+  "z1": 11.067791421558011,
+  "zero_ks": 0.24688057040998218
+}
