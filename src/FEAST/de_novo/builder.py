@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from ..FEAST_core.count_decoding import decode_counts_from_quantiles, resolve_decode_method
+from ..FEAST_core.count_decoding import decode_counts_by_rank
 from .conditional import SimulationConfig, _quantile_field_config
 from .core import SliceBlueprint, active_mask_metadata, assign_generated_coordinates, load_blueprint
 from .pattern import diffuse_quantile_map
@@ -481,17 +481,13 @@ def simulate_from_design(
     labels = bp.obs[label_key].astype(str).to_numpy()
     counts = np.zeros((n_spots, n_genes), dtype=np.int32)
     label_cloud_summary: Dict[str, Dict[str, float]] = {}
-    decode_method = resolve_decode_method(gen_cfg.decode_method, allow_auto=True)
-
     for label in sorted(np.unique(labels)):
         mask = labels == label
         label_cloud = _resolve_parameter_cloud_for_label(parameter_cloud, gene_names, label=label)
         model_params = _stats_frame_to_model_params(label_cloud)
-        decoded = decode_counts_from_quantiles(
+        decoded = decode_counts_by_rank(
             quantiles_arr[mask, :],
             model_params,
-            method=decode_method,
-            quantile_calibration=str(gen_cfg.quantile_calibration),
             boundary_multiplier=float(gen_cfg.boundary_multiplier),
             random_seed=int(random_seed),
             show_progress=bool(gen_cfg.verbose),
@@ -533,8 +529,8 @@ def simulate_from_design(
         "conditional_generation": False,
         "designed_generation": True,
         "label_key": label_key,
-        "decode_method": decode_method,
-        "quantile_calibration": str(gen_cfg.quantile_calibration),
+        "decode_method": "rank",
+        "quantile_calibration": "reference_rank",
         "diffusion_level": float(gen_cfg.diffusion_level),
         "boundary_softness": float(gen_cfg.boundary_softness),
         "assignment_randomness": float(gen_cfg.assignment_randomness),
