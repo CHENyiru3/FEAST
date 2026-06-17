@@ -292,7 +292,7 @@ class GeneParameterSimulator:
 
         selected_costs = cost_matrix[row_ind, col_ind]
         diagnostics = {
-            'assignment_method': 'copula_rank_ot',
+            'assignment_method': 'copula_rank',
             'mean_cost': float(np.mean(selected_costs)) if selected_costs.size else 0.0,
             'max_cost': float(np.max(selected_costs)) if selected_costs.size else 0.0,
             'total_cost': float(np.sum(selected_costs)),
@@ -314,7 +314,7 @@ class GeneParameterSimulator:
         simulation_mode='generative',
         assignment_weights=None,
         random_seed=None,
-        assignment_method='hybrid_ot',
+        assignment_method='hybrid',
         overgeneration_factor=2.0,
         verbose=True,
     ):
@@ -351,7 +351,7 @@ class GeneParameterSimulator:
         )
         requested = apply_alteration_to_stats(sampled_params, config)
         projected, feasibility = project_stats_to_feasible_domain(requested)
-        if assignment_method == 'copula_rank_ot':
+        if assignment_method == 'copula_rank':
             assigned, assignment_diag = self.assign_to_genes_copula_rank(
                 projected,
                 sampled_u,
@@ -367,7 +367,7 @@ class GeneParameterSimulator:
                 verbose=verbose,
                 hybrid_alpha=getattr(self, 'hybrid_alpha', 0.2),
             )
-            assignment_diag = {'assignment_method': 'hybrid_ot',
+            assignment_diag = {'assignment_method': 'hybrid',
                                'hybrid_alpha': getattr(self, 'hybrid_alpha', 0.2),
                                'weights': assignment_weights or {'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0}}
         diagnostics = {

@@ -84,3 +84,8 @@ venv.bak/
 example_data/
 results/
 outputs/
+
+# Non-core directories
+benchmark_scripts/
+reproduction/
+tests/
