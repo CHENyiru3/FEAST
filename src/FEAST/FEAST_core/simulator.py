@@ -3,6 +3,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import warnings
+from scipy.spatial.distance import cdist
 
 from .count_decoding import decode_counts_by_rank
 from .parameter_cloud import (
@@ -196,7 +197,7 @@ class SpatialSimulator:
         """Get current model parameters."""
         return self._model_params
     
-    def simulate(self, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.0, boundary_multiplier: float = 1.1, random_seed: int = None, spatial_mode: str = 'reference_rank') -> ad.AnnData:
+    def simulate(self, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.0, boundary_multiplier: float = 1.1, random_seed: int = None, spatial_mode: str = 'reference_rank', target_adata=None) -> ad.AnnData:
         """
         Args:
             num_simulation_cores (int): Number of cores for simulation (legacy parameter).
@@ -205,6 +206,7 @@ class SpatialSimulator:
             boundary_multiplier (float): Multiplier for maximum count boundary constraint (default 1.1 = 110% of reference max).
             random_seed (int, optional): Seed for reproducible sampling.
             spatial_mode: 'reference_rank' or 'ot_spatial'.
+            target_adata: Required when spatial_mode='ot_spatial'.
         """
         if self._model_params is None:
             raise ValueError("Model parameters not set. Call fit_model() first or provide model_params in constructor.")
@@ -220,6 +222,7 @@ class SpatialSimulator:
             boundary_multiplier=boundary_multiplier,
             random_seed=random_seed,
             spatial_mode=spatial_mode,
+            target_adata=target_adata,
         )
         
         if verbose:
@@ -228,10 +231,9 @@ class SpatialSimulator:
         safe_calculate_qc_metrics(simulated_adata)
         return simulated_adata
 
-    def _apply_quantile_count_decoding(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, random_seed=None, spatial_mode='reference_rank'):
+    def _apply_quantile_count_decoding(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, random_seed=None, spatial_mode='reference_rank', target_adata=None):
         """Generate counts from model parameters through rank-based count decoding."""
         reference_matrix = _dense_matrix(reference_adata.X, dtype=np.float64)
-        spatial_coords = reference_adata.obsm['spatial']
         n_spots, n_genes = reference_matrix.shape
 
         mode = resolve_simulation_mode(model_params.get('simulation_mode', 'empirical'))
@@ -240,26 +242,57 @@ class SpatialSimulator:
         if spatial_mode not in SPATIAL_MODES:
             raise ValueError(f"spatial_mode must be one of {SPATIAL_MODES}, got '{spatial_mode}'")
 
+        if spatial_mode == 'ot_spatial':
+            if target_adata is None:
+                raise ValueError("target_adata is required when spatial_mode='ot_spatial'.")
+            target_coords = target_adata.obsm['spatial']
+            n_target = target_coords.shape[0]
+            common_genes = reference_adata.var_names.intersection(target_adata.var_names)
+            if len(common_genes) < n_genes:
+                target_adata = target_adata[:, common_genes].copy()
+                reference_matrix = reference_matrix[:, reference_adata.var_names.get_indexer(common_genes)]
+                n_genes = len(common_genes)
+
+            source_coords = reference_adata.obsm['spatial']
+            cost = cdist(source_coords, target_coords, metric='euclidean')
+            a = np.ones(n_spots) / n_spots
+            b = np.ones(n_target) / n_target
+
+            from ..de_novo._ot_transport import sinkhorn_transport
+            plan = sinkhorn_transport(M=cost, a=a, b=b, reg=0.05)
+            transported = plan.T @ reference_matrix
+
+            spatial_coords = target_coords.copy()
+            reference_for_clip = reference_matrix
+            n_spots = n_target
+            quantile_input = transported
+        else:
+            spatial_coords = reference_adata.obsm['spatial']
+            reference_for_clip = reference_matrix
+            quantile_input = reference_matrix
+
         simulated_matrix = decode_counts_by_rank(
-            reference_matrix,
+            quantile_input,
             model_params,
             boundary_multiplier=boundary_multiplier,
-            reference_X=reference_matrix,
+            reference_X=reference_for_clip,
             random_seed=seed,
         ).astype(np.float32, copy=False)
 
         boundary_clipped_gene_count = 0
         if clip_overshoot_factor > 0:
-            max_ref_counts = np.max(reference_matrix, axis=0)
+            max_ref_counts = np.max(reference_for_clip, axis=0)
             clip_max = max_ref_counts * (1 + clip_overshoot_factor)
             before = simulated_matrix.copy()
             simulated_matrix = np.clip(simulated_matrix, 0, clip_max)
             boundary_clipped_gene_count = int(np.any(np.abs(before - simulated_matrix) > 1e-12, axis=0).sum())
 
+        obs = target_adata.obs.copy() if spatial_mode == 'ot_spatial' else reference_adata.obs.copy()
+        var = target_adata.var.copy() if spatial_mode == 'ot_spatial' else reference_adata.var.copy()
         simulated_adata = ad.AnnData(
             X=simulated_matrix.astype(np.float32),
-            obs=reference_adata.obs.copy(),
-            var=reference_adata.var.copy(),
+            obs=obs,
+            var=var,
             obsm={'spatial': spatial_coords.copy()}
         )
         simulated_adata.uns['simulation_method'] = 'Quantile_Count_Decoding'
@@ -906,11 +939,13 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
             **heuristic_kwargs # Pass all heuristic controls
         )
         simulated_adata = simulator.simulate(
-            num_simulation_cores=num_simulation_cores, 
-            verbose=verbose, 
+            num_simulation_cores=num_simulation_cores,
+            verbose=verbose,
             clip_overshoot_factor=clip_overshoot_factor,
             boundary_multiplier=boundary_multiplier,
             random_seed=random_seed,
+            spatial_mode=spatial_mode,
+            target_adata=target_adata,
         )
         
     if verbose: print(f"\nSimulation completed successfully!")
