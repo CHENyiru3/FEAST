@@ -92,7 +92,7 @@ def _hdf5_safe_metadata(value):
     return value
 
 
-def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_search=True, min_accepted_error=0.5, assignment_weights=None, screening_pool_size=100, top_n_to_fully_evaluate=10, n_jobs=-1, alteration_config=None, simulation_mode='generative', quantile_calibration=None, decode_method='quantile', assignment_method='hybrid_ot', random_seed=None, hybrid_alpha=0.2):
+def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_search=True, min_accepted_error=0.5, assignment_weights=None, screening_pool_size=100, top_n_to_fully_evaluate=10, n_jobs=-1, alteration_config=None, simulation_mode='generative', quantile_calibration=None, decode_method='quantile', assignment_method='hybrid', random_seed=None, hybrid_alpha=0.2):
     """
     Build an integrated FEAST gene-parameter table and convert it to count-model parameters.
 
@@ -167,7 +167,7 @@ class SpatialSimulator:
         self.reference_adata.obs_names_make_unique()
         self._model_params = model_params
 
-    def fit_model(self, visualize_fits: bool = False, use_real_stats_directly: bool = False, use_heuristic_search: bool = False, min_accepted_error: float = 0.5, assignment_weights: dict = None, screening_pool_size: int = 100, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, simulation_mode: str = 'generative', quantile_calibration=None, decode_method: str = 'quantile', assignment_method: str = 'hybrid_ot', random_seed: int = None, hybrid_alpha: float = 0.2) -> 'SpatialSimulator':
+    def fit_model(self, visualize_fits: bool = False, use_real_stats_directly: bool = False, use_heuristic_search: bool = False, min_accepted_error: float = 0.5, assignment_weights: dict = None, screening_pool_size: int = 100, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, simulation_mode: str = 'generative', quantile_calibration=None, decode_method: str = 'quantile', assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2) -> 'SpatialSimulator':
         """
         UPDATED: Exposes the new boosted heuristic search parameters and marginal distribution alteration.
         
@@ -328,7 +328,7 @@ class SpatialSimulator:
             'gene_parameter_engine': parameter_diagnostics.get('gene_parameter_engine', simulation_mode),
             'assignment_method': parameter_diagnostics.get(
                 'assignment_method',
-                'identity' if simulation_mode == 'empirical' else 'copula_rank_ot',
+                'identity' if simulation_mode == 'empirical' else 'copula_rank',
             ),
             'quantile_calibration': quantile_calibration,
             'random_seed': None if random_seed is None else int(random_seed),
@@ -827,7 +827,7 @@ class SpatialSimulator:
             "simulation_mode": kwargs.get("simulation_mode", "generative"),
             "quantile_calibration": kwargs.get("quantile_calibration"),
             "decode_method": kwargs.get("decode_method", "quantile"),
-            "assignment_method": kwargs.get("assignment_method", "hybrid_ot"),
+            "assignment_method": kwargs.get("assignment_method", "hybrid"),
             "random_seed": kwargs.get("random_seed"),
             "hybrid_alpha": kwargs.get("hybrid_alpha", 0.2),
         }
@@ -843,7 +843,7 @@ class SpatialSimulator:
         return simulated
     
 
-def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, simulation_mode: str = 'generative', quantile_calibration=None, decode_method: str = 'quantile', assignment_method: str = 'hybrid_ot', random_seed: int = None, hybrid_alpha: float = 0.2) -> ad.AnnData:
+def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, simulation_mode: str = 'generative', quantile_calibration=None, decode_method: str = 'quantile', assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2) -> ad.AnnData:
     """
     Run single-slice simulation with explicit generative or empirical semantics.
 
@@ -874,6 +874,13 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
             stacklevel=2,
         )
     simulation_mode = resolve_simulation_mode(simulation_mode)
+    if simulation_mode == 'empirical' and assignment_method not in (None, 'hybrid', 'identity'):
+        warnings.warn(
+            f"assignment_method='{assignment_method}' is ignored when "
+            f"simulation_mode='empirical' (reference_stats). Assignment is always 'identity'.",
+            UserWarning,
+            stacklevel=2,
+        )
     if verbose: print("Starting comprehensive single slice simulation...")
     adata = adata.copy()
     safe_calculate_qc_metrics(adata, verbose=verbose)

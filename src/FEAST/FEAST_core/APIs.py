@@ -62,7 +62,7 @@ class FEAST:
         simulation_mode: str = "generative",
         quantile_calibration: Optional[str] = None,
         decode_method: str = "quantile",
-        assignment_method: str = "hybrid_ot",
+        assignment_method: str = "hybrid",
         random_seed: Optional[int] = None,
     ) -> ad.AnnData:
         if verbose is None:
