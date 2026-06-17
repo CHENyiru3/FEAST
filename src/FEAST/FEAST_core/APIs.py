@@ -59,11 +59,11 @@ class FEAST:
         n_jobs: int = -1,
         alteration_config: Optional[Any] = None,
         boundary_multiplier: float = 1.1,
-        simulation_mode: str = "generative",
-        quantile_calibration: Optional[str] = None,
-        decode_method: str = "quantile",
-        assignment_method: str = "hybrid_ot",
+        parameter_mode: str = "hungarian",
+        spatial_mode: str = "reference_rank",
+        assignment_method: str = "hybrid",
         random_seed: Optional[int] = None,
+        target_adata=None,
     ) -> ad.AnnData:
         if verbose is None:
             verbose = self.verbose
@@ -83,9 +83,9 @@ class FEAST:
             n_jobs=n_jobs,
             alteration_config=alteration_config,
             boundary_multiplier=boundary_multiplier,
-            simulation_mode=simulation_mode,
-            quantile_calibration=quantile_calibration,
-            decode_method=decode_method,
+            parameter_mode=parameter_mode,
+            spatial_mode=spatial_mode,
+            target_adata=target_adata,
             assignment_method=assignment_method,
             random_seed=random_seed,
         )
@@ -120,8 +120,8 @@ class FEAST:
         n_jobs: int = -1,
         alteration_config: Optional[Any] = None,
         boundary_multiplier: float = 1.1,
-        simulation_mode: str = "generative",
-        quantile_calibration: Optional[str] = None,
+        parameter_mode: str = "hungarian",
+        spatial_mode: str = "reference_rank",
         random_seed: Optional[int] = None,
         verbose: Optional[bool] = None,
     ) -> tuple:
@@ -142,8 +142,8 @@ class FEAST:
             "n_jobs": n_jobs,
             "alteration_config": alteration_config,
             "boundary_multiplier": boundary_multiplier,
-            "simulation_mode": simulation_mode,
-            "quantile_calibration": quantile_calibration,
+            "parameter_mode": parameter_mode,
+            "spatial_mode": spatial_mode,
             "random_seed": random_seed,
             "verbose": verbose,
         }

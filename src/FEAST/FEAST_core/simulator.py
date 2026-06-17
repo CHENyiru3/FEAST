@@ -14,36 +14,28 @@ from .parameter_cloud import (
     resolve_simulation_mode,
 )
 
-QUANTILE_CALIBRATION_SOURCES = ("reference_rank",)
+PARAMETER_MODES = ("hungarian", "reference_stats")
+SPATIAL_MODES = ("reference_rank", "ot_spatial")
+
+# Internal translation: public parameter_mode ↔ internal simulation_mode
+_PARAMETER_TO_SIMULATION = {"hungarian": "generative", "reference_stats": "empirical"}
+_SIMULATION_TO_PARAMETER = {"generative": "hungarian", "empirical": "reference_stats"}
 
 
-def resolve_quantile_calibration_source(quantile_calibration=None, simulation_mode: str = "generative") -> str:
-    """Normalize the source of spot-gene quantiles used during decoding.
+def _translate_parameter_mode(parameter_mode):
+    """Translate public parameter_mode to internal simulation_mode string."""
+    if parameter_mode in _PARAMETER_TO_SIMULATION:
+        return _PARAMETER_TO_SIMULATION[parameter_mode]
+    raise ValueError(f"parameter_mode must be one of {PARAMETER_MODES}, got '{parameter_mode}'")
 
-    Only 'reference_rank' is supported. Passing 'raw' raises an error.
-    """
-    if quantile_calibration is None:
-        return "reference_rank"
-    source = str(quantile_calibration).lower().strip()
-    if source in {"auto", "default"}:
-        return "reference_rank"
-    aliases = {
-        "rank": "reference_rank",
-        "reference": "reference_rank",
-        "reference_rank": "reference_rank",
-        "empirical": "reference_rank",
-        "empirical_rank": "reference_rank",
-    }
-    if source in aliases:
-        return aliases[source]
-    if source in {"iid", "uniform", "raw"}:
-        raise ValueError(
-            "quantile_calibration='raw' has been removed. "
-            "Use quantile_calibration='reference_rank' instead."
-        )
-    if source not in QUANTILE_CALIBRATION_SOURCES:
-        raise ValueError("quantile_calibration must be 'reference_rank' or 'auto'.")
-    return source
+
+def _translate_spatial_mode(spatial_mode):
+    """Validate and normalize spatial_mode."""
+    if spatial_mode not in SPATIAL_MODES:
+        raise ValueError(f"spatial_mode must be one of {SPATIAL_MODES}, got '{spatial_mode}'")
+    return spatial_mode
+
+
 
 
 def safe_calculate_qc_metrics(adata, verbose=False):
@@ -92,7 +84,7 @@ def _hdf5_safe_metadata(value):
     return value
 
 
-def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_search=True, min_accepted_error=0.5, assignment_weights=None, screening_pool_size=100, top_n_to_fully_evaluate=10, n_jobs=-1, alteration_config=None, simulation_mode='generative', quantile_calibration=None, decode_method='quantile', assignment_method='hybrid_ot', random_seed=None, hybrid_alpha=0.2):
+def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_search=True, min_accepted_error=0.5, assignment_weights=None, screening_pool_size=100, top_n_to_fully_evaluate=10, n_jobs=-1, alteration_config=None, simulation_mode='generative', spatial_mode='reference_rank', assignment_method='hybrid', random_seed=None, hybrid_alpha=0.2):
     """
     Build an integrated FEAST gene-parameter table and convert it to count-model parameters.
 
@@ -106,7 +98,6 @@ def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_searc
     if assignment_weights is None:
         assignment_weights = {'mean': 3, 'variance': 1, 'zero_prop': 1.0}
     mode = resolve_simulation_mode(simulation_mode)
-    quantile_source = resolve_quantile_calibration_source(quantile_calibration, mode)
     if use_heuristic_search:
         warnings.warn(
             "use_heuristic_search is retained for compatibility but is ignored by the "
@@ -167,7 +158,7 @@ class SpatialSimulator:
         self.reference_adata.obs_names_make_unique()
         self._model_params = model_params
 
-    def fit_model(self, visualize_fits: bool = False, use_real_stats_directly: bool = False, use_heuristic_search: bool = False, min_accepted_error: float = 0.5, assignment_weights: dict = None, screening_pool_size: int = 100, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, simulation_mode: str = 'generative', quantile_calibration=None, decode_method: str = 'quantile', assignment_method: str = 'hybrid_ot', random_seed: int = None, hybrid_alpha: float = 0.2) -> 'SpatialSimulator':
+    def fit_model(self, visualize_fits: bool = False, use_real_stats_directly: bool = False, use_heuristic_search: bool = False, min_accepted_error: float = 0.5, assignment_weights: dict = None, screening_pool_size: int = 100, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, simulation_mode: str = 'generative', spatial_mode: str = 'reference_rank', assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2) -> 'SpatialSimulator':
         """
         UPDATED: Exposes the new boosted heuristic search parameters and marginal distribution alteration.
         
@@ -179,7 +170,7 @@ class SpatialSimulator:
             self._model_params = run_direct_fitting_from_real_stats(adata_for_fitting)
         else: 
             self._model_params = run_parameter_cloud_fitting(
-                adata_for_fitting, 
+                adata_for_fitting,
                 visualize_fits=visualize_fits,
                 use_heuristic_search=use_heuristic_search,
                 min_accepted_error=min_accepted_error,
@@ -189,8 +180,7 @@ class SpatialSimulator:
                 n_jobs=n_jobs,
                 alteration_config=alteration_config,
                 simulation_mode=simulation_mode,
-                quantile_calibration=quantile_calibration,
-                decode_method=decode_method,
+                spatial_mode=spatial_mode,
                 assignment_method=assignment_method,
                 random_seed=random_seed,
                 hybrid_alpha=hybrid_alpha,
@@ -206,21 +196,22 @@ class SpatialSimulator:
         """Get current model parameters."""
         return self._model_params
     
-    def simulate(self, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.0, boundary_multiplier: float = 1.1, random_seed: int = None) -> ad.AnnData:
+    def simulate(self, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.0, boundary_multiplier: float = 1.1, random_seed: int = None, spatial_mode: str = 'reference_rank') -> ad.AnnData:
         """
         Args:
             num_simulation_cores (int): Number of cores for simulation (legacy parameter).
             verbose (bool): If True, prints progress updates.
             clip_overshoot_factor (float): Factor to clip max expression values relative to reference.
             boundary_multiplier (float): Multiplier for maximum count boundary constraint (default 1.1 = 110% of reference max).
-            random_seed (int, optional): Seed for raw generative quantile decoding.
+            random_seed (int, optional): Seed for reproducible sampling.
+            spatial_mode: 'reference_rank' or 'ot_spatial'.
         """
         if self._model_params is None:
             raise ValueError("Model parameters not set. Call fit_model() first or provide model_params in constructor.")
-        
+
         if verbose:
             print("Generating simulated data with quantile count decoding...")
-        
+
         simulated_adata = self._apply_quantile_count_decoding(
             reference_adata=self.reference_adata,
             model_params=self._model_params,
@@ -228,6 +219,7 @@ class SpatialSimulator:
             clip_overshoot_factor=clip_overshoot_factor,
             boundary_multiplier=boundary_multiplier,
             random_seed=random_seed,
+            spatial_mode=spatial_mode,
         )
         
         if verbose:
@@ -236,7 +228,7 @@ class SpatialSimulator:
         safe_calculate_qc_metrics(simulated_adata)
         return simulated_adata
 
-    def _apply_quantile_count_decoding(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, random_seed=None):
+    def _apply_quantile_count_decoding(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, random_seed=None, spatial_mode='reference_rank'):
         """Generate counts from model parameters through rank-based count decoding."""
         reference_matrix = _dense_matrix(reference_adata.X, dtype=np.float64)
         spatial_coords = reference_adata.obsm['spatial']
@@ -245,17 +237,8 @@ class SpatialSimulator:
         mode = resolve_simulation_mode(model_params.get('simulation_mode', 'empirical'))
         diagnostics_seed = model_params.get('random_seed', None)
         seed = random_seed if random_seed is not None else diagnostics_seed
-        quantile_calibration = model_params.get(
-            'quantile_calibration',
-            'reference_rank',
-        )
-        if quantile_calibration in ('raw', 'iid', 'uniform'):
-            raise ValueError(
-                "quantile_calibration='raw' has been removed. "
-                "Use quantile_calibration='reference_rank' instead."
-            )
-        if quantile_calibration != 'reference_rank':
-            raise ValueError("quantile_calibration must be 'reference_rank'.")
+        if spatial_mode not in SPATIAL_MODES:
+            raise ValueError(f"spatial_mode must be one of {SPATIAL_MODES}, got '{spatial_mode}'")
 
         simulated_matrix = decode_counts_by_rank(
             reference_matrix,
@@ -284,6 +267,7 @@ class SpatialSimulator:
             'clip_overshoot_factor': float(clip_overshoot_factor),
             'boundary_multiplier': float(boundary_multiplier),
             'simulation_mode': mode,
+            'spatial_mode': spatial_mode,
             'random_seed': "none" if seed is None else int(seed),
         }
         simulated_adata.uns['simulation_diagnostics'] = _hdf5_safe_metadata(self._build_simulation_diagnostics(
@@ -291,7 +275,7 @@ class SpatialSimulator:
             simulated_matrix=simulated_matrix,
             model_params=model_params,
             simulation_mode=mode,
-            quantile_calibration=quantile_calibration,
+            spatial_mode=spatial_mode,
             random_seed=seed,
             boundary_clipped_gene_count=boundary_clipped_gene_count,
             clip_overshoot_factor=clip_overshoot_factor,
@@ -310,7 +294,7 @@ class SpatialSimulator:
         simulated_matrix,
         model_params,
         simulation_mode,
-        quantile_calibration,
+        spatial_mode,
         random_seed,
         boundary_clipped_gene_count,
         clip_overshoot_factor,
@@ -328,9 +312,9 @@ class SpatialSimulator:
             'gene_parameter_engine': parameter_diagnostics.get('gene_parameter_engine', simulation_mode),
             'assignment_method': parameter_diagnostics.get(
                 'assignment_method',
-                'identity' if simulation_mode == 'empirical' else 'copula_rank_ot',
+                'identity' if simulation_mode == 'empirical' else 'copula_rank',
             ),
-            'quantile_calibration': quantile_calibration,
+            'spatial_mode': spatial_mode,
             'random_seed': None if random_seed is None else int(random_seed),
             'requested_config': parameter_diagnostics.get('requested_config'),
             'target_fold_change': parameter_diagnostics.get('target_fold_change'),
@@ -824,10 +808,11 @@ class SpatialSimulator:
             "top_n_to_fully_evaluate": kwargs.get("top_n_to_fully_evaluate", 10),
             "n_jobs": kwargs.get("n_jobs", -1),
             "alteration_config": kwargs.get("alteration_config"),
-            "simulation_mode": kwargs.get("simulation_mode", "generative"),
-            "quantile_calibration": kwargs.get("quantile_calibration"),
-            "decode_method": kwargs.get("decode_method", "quantile"),
-            "assignment_method": kwargs.get("assignment_method", "hybrid_ot"),
+            "simulation_mode": _translate_parameter_mode(
+                kwargs.get("parameter_mode", "hungarian")
+            ),
+            "spatial_mode": kwargs.get("spatial_mode", "reference_rank"),
+            "assignment_method": kwargs.get("assignment_method", "hybrid"),
             "random_seed": kwargs.get("random_seed"),
             "hybrid_alpha": kwargs.get("hybrid_alpha", 0.2),
         }
@@ -838,42 +823,38 @@ class SpatialSimulator:
             clip_overshoot_factor=kwargs.get("clip_overshoot_factor", 0.1),
             boundary_multiplier=kwargs.get("boundary_multiplier", 1.1),
             random_seed=kwargs.get("random_seed"),
+            spatial_mode=kwargs.get("spatial_mode", "reference_rank"),
         )
         simulated.uns["annotation_key"] = annotation_key
         return simulated
     
 
-def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, simulation_mode: str = 'generative', quantile_calibration=None, decode_method: str = 'quantile', assignment_method: str = 'hybrid_ot', random_seed: int = None, hybrid_alpha: float = 0.2) -> ad.AnnData:
+def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, parameter_mode: str = 'hungarian', spatial_mode: str = 'reference_rank', target_adata=None, assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2) -> ad.AnnData:
     """
-    Run single-slice simulation with explicit generative or empirical semantics.
+    Run single-slice simulation.
 
     Args:
         boundary_multiplier (float): Multiplier for maximum count boundary constraint (default 1.1 = 110% of reference max).
         alteration_config (AlterationConfig or dict, optional): Configuration for altering marginal distributions.
-        simulation_mode: "generative" by default, or "empirical" for strict controlled alteration.
-        quantile_calibration: Deprecated. Only 'reference_rank' is supported. Passing 'raw' raises an error.
-        decode_method: Deprecated. Count decoding is always rank-based now.
+        parameter_mode: 'hungarian' (copula + Hungarian assignment) or 'reference_stats' (direct reference stats).
+        spatial_mode: 'reference_rank' (rank-preserving) or 'ot_spatial' (OT transport, requires target_adata).
+        target_adata: Target AnnData for ot_spatial mode (required when spatial_mode='ot_spatial').
+        assignment_method: 'hybrid' or 'copula_rank' — only meaningful when parameter_mode='hungarian'.
         random_seed: Optional seed for reproducible generative sampling.
     """
-    if quantile_calibration is not None:
-        qc = str(quantile_calibration).lower().strip()
-        if qc in ('raw', 'iid', 'uniform'):
-            raise ValueError(
-                "quantile_calibration='raw' has been removed. "
-                "Use quantile_calibration='reference_rank' (or omit)."
-            )
+    # --- translate public API → internal naming ---
+    simulation_mode = _translate_parameter_mode(parameter_mode)
+    spatial_mode = _translate_spatial_mode(spatial_mode)
+    if spatial_mode == "ot_spatial" and target_adata is None:
+        raise ValueError("target_adata is required when spatial_mode='ot_spatial'.")
+
+    if simulation_mode == 'empirical' and assignment_method not in (None, 'hybrid', 'identity'):
         warnings.warn(
-            "quantile_calibration is deprecated and ignored; count decoding is always rank-based.",
-            DeprecationWarning,
+            f"assignment_method='{assignment_method}' is ignored when "
+            f"parameter_mode='reference_stats'. Assignment is always 'identity'.",
+            UserWarning,
             stacklevel=2,
         )
-    if decode_method != 'quantile':
-        warnings.warn(
-            "decode_method is deprecated and ignored; count decoding is always rank-based.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-    simulation_mode = resolve_simulation_mode(simulation_mode)
     if verbose: print("Starting comprehensive single slice simulation...")
     adata = adata.copy()
     safe_calculate_qc_metrics(adata, verbose=verbose)
@@ -888,8 +869,7 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
         'top_n_to_fully_evaluate': top_n_to_fully_evaluate,
         'n_jobs': n_jobs,
         'simulation_mode': simulation_mode,
-        'quantile_calibration': quantile_calibration,
-        'decode_method': decode_method,
+        'spatial_mode': spatial_mode,
         'assignment_method': assignment_method,
         'random_seed': random_seed,
         'hybrid_alpha': hybrid_alpha,
