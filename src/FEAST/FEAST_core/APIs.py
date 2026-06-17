@@ -61,6 +61,8 @@ class FEAST:
         boundary_multiplier: float = 1.1,
         simulation_mode: str = "generative",
         quantile_calibration: Optional[str] = None,
+        decode_method: str = "quantile",
+        assignment_method: str = "hybrid_ot",
         random_seed: Optional[int] = None,
     ) -> ad.AnnData:
         if verbose is None:
@@ -83,6 +85,8 @@ class FEAST:
             boundary_multiplier=boundary_multiplier,
             simulation_mode=simulation_mode,
             quantile_calibration=quantile_calibration,
+            decode_method=decode_method,
+            assignment_method=assignment_method,
             random_seed=random_seed,
         )
 

@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import warnings
 
-from .count_decoding import decode_counts_from_quantiles
+from .count_decoding import decode_counts_by_rank
 from .parameter_cloud import (
     STAT_COLUMNS,
     GeneParameterSimulator,
@@ -14,30 +14,35 @@ from .parameter_cloud import (
     resolve_simulation_mode,
 )
 
-QUANTILE_CALIBRATION_SOURCES = ("reference_rank", "raw")
+QUANTILE_CALIBRATION_SOURCES = ("reference_rank",)
 
 
 def resolve_quantile_calibration_source(quantile_calibration=None, simulation_mode: str = "generative") -> str:
-    """Normalize the source of spot-gene quantiles used during decoding."""
-    mode = resolve_simulation_mode(simulation_mode)
+    """Normalize the source of spot-gene quantiles used during decoding.
+
+    Only 'reference_rank' is supported. Passing 'raw' raises an error.
+    """
     if quantile_calibration is None:
-        return "reference_rank" if mode == "empirical" else "raw"
+        return "reference_rank"
     source = str(quantile_calibration).lower().strip()
     if source in {"auto", "default"}:
-        return "reference_rank" if mode == "empirical" else "raw"
+        return "reference_rank"
     aliases = {
         "rank": "reference_rank",
         "reference": "reference_rank",
         "reference_rank": "reference_rank",
         "empirical": "reference_rank",
         "empirical_rank": "reference_rank",
-        "iid": "raw",
-        "uniform": "raw",
-        "raw": "raw",
     }
-    source = aliases.get(source, source)
+    if source in aliases:
+        return aliases[source]
+    if source in {"iid", "uniform", "raw"}:
+        raise ValueError(
+            "quantile_calibration='raw' has been removed. "
+            "Use quantile_calibration='reference_rank' instead."
+        )
     if source not in QUANTILE_CALIBRATION_SOURCES:
-        raise ValueError("quantile_calibration must be 'reference_rank', 'raw', or 'auto'.")
+        raise ValueError("quantile_calibration must be 'reference_rank' or 'auto'.")
     return source
 
 
@@ -87,7 +92,7 @@ def _hdf5_safe_metadata(value):
     return value
 
 
-def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_search=True, min_accepted_error=0.5, assignment_weights=None, screening_pool_size=100, top_n_to_fully_evaluate=10, n_jobs=-1, alteration_config=None, simulation_mode='generative', quantile_calibration=None, random_seed=None, hybrid_alpha=0.2):
+def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_search=True, min_accepted_error=0.5, assignment_weights=None, screening_pool_size=100, top_n_to_fully_evaluate=10, n_jobs=-1, alteration_config=None, simulation_mode='generative', quantile_calibration=None, decode_method='quantile', assignment_method='hybrid_ot', random_seed=None, hybrid_alpha=0.2):
     """
     Build an integrated FEAST gene-parameter table and convert it to count-model parameters.
 
@@ -122,6 +127,7 @@ def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_searc
         simulation_mode=mode,
         assignment_weights=assignment_weights,
         random_seed=random_seed,
+        assignment_method=assignment_method,
         verbose=True,
     )
 
@@ -130,14 +136,11 @@ def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_searc
     model_params['simulation_evaluation'] = {
         'source': 'integrated_parameter_cloud',
         'simulation_mode': mode,
-        'quantile_calibration': quantile_source,
     }
     model_params['simulation_mode'] = mode
     model_params['random_seed'] = None if random_seed is None else int(random_seed)
     model_params['target_stats'] = assigned_synthetic_params
     model_params['parameter_diagnostics'] = diagnostics
-    model_params['count_decode_method'] = 'quantile'
-    model_params['quantile_calibration'] = quantile_source
     print(">>> Exiting parameter_cloud pipeline <<<\n")
     return model_params
 
@@ -152,8 +155,6 @@ def run_direct_fitting_from_real_stats(adata):
     model_params['simulation_evaluation'] = {'source': 'direct_from_real_stats', 'simulation_mode': 'empirical'}
     model_params['simulation_mode'] = 'empirical'
     model_params['target_stats'] = real_stats_for_conversion
-    model_params['count_decode_method'] = 'quantile'
-    model_params['quantile_calibration'] = 'reference_rank'
     print(">>> Diagnostic fitting complete <<<\n")
     return model_params
 
@@ -166,7 +167,7 @@ class SpatialSimulator:
         self.reference_adata.obs_names_make_unique()
         self._model_params = model_params
 
-    def fit_model(self, visualize_fits: bool = False, use_real_stats_directly: bool = False, use_heuristic_search: bool = False, min_accepted_error: float = 0.5, assignment_weights: dict = None, screening_pool_size: int = 100, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, simulation_mode: str = 'generative', quantile_calibration=None, random_seed: int = None, hybrid_alpha: float = 0.2) -> 'SpatialSimulator':
+    def fit_model(self, visualize_fits: bool = False, use_real_stats_directly: bool = False, use_heuristic_search: bool = False, min_accepted_error: float = 0.5, assignment_weights: dict = None, screening_pool_size: int = 100, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, simulation_mode: str = 'generative', quantile_calibration=None, decode_method: str = 'quantile', assignment_method: str = 'hybrid_ot', random_seed: int = None, hybrid_alpha: float = 0.2) -> 'SpatialSimulator':
         """
         UPDATED: Exposes the new boosted heuristic search parameters and marginal distribution alteration.
         
@@ -189,6 +190,8 @@ class SpatialSimulator:
                 alteration_config=alteration_config,
                 simulation_mode=simulation_mode,
                 quantile_calibration=quantile_calibration,
+                decode_method=decode_method,
+                assignment_method=assignment_method,
                 random_seed=random_seed,
                 hybrid_alpha=hybrid_alpha,
             )
@@ -234,7 +237,7 @@ class SpatialSimulator:
         return simulated_adata
 
     def _apply_quantile_count_decoding(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, random_seed=None):
-        """Generate counts from model parameters through the integrated quantile decoder."""
+        """Generate counts from model parameters through rank-based count decoding."""
         reference_matrix = _dense_matrix(reference_adata.X, dtype=np.float64)
         spatial_coords = reference_adata.obsm['spatial']
         n_spots, n_genes = reference_matrix.shape
@@ -244,24 +247,19 @@ class SpatialSimulator:
         seed = random_seed if random_seed is not None else diagnostics_seed
         quantile_calibration = model_params.get(
             'quantile_calibration',
-            'reference_rank' if mode == 'empirical' else 'raw',
+            'reference_rank',
         )
+        if quantile_calibration in ('raw', 'iid', 'uniform'):
+            raise ValueError(
+                "quantile_calibration='raw' has been removed. "
+                "Use quantile_calibration='reference_rank' instead."
+            )
+        if quantile_calibration != 'reference_rank':
+            raise ValueError("quantile_calibration must be 'reference_rank'.")
 
-        if quantile_calibration == 'reference_rank':
-            quantile_input = reference_matrix
-            decoder_calibration = 'rank'
-        elif quantile_calibration == 'raw':
-            rng = np.random.default_rng(None if seed is None else int(seed))
-            quantile_input = rng.random((n_spots, n_genes), dtype=np.float64)
-            decoder_calibration = 'raw'
-        else:
-            raise ValueError("quantile_calibration must be 'reference_rank' or 'raw' for integrated simulation.")
-
-        simulated_matrix = decode_counts_from_quantiles(
-            quantile_input,
+        simulated_matrix = decode_counts_by_rank(
+            reference_matrix,
             model_params,
-            method='quantile',
-            quantile_calibration=decoder_calibration,
             boundary_multiplier=boundary_multiplier,
             reference_X=reference_matrix,
             random_seed=seed,
@@ -332,7 +330,6 @@ class SpatialSimulator:
                 'assignment_method',
                 'identity' if simulation_mode == 'empirical' else 'copula_rank_ot',
             ),
-            'count_decode_method': 'quantile',
             'quantile_calibration': quantile_calibration,
             'random_seed': None if random_seed is None else int(random_seed),
             'requested_config': parameter_diagnostics.get('requested_config'),
@@ -829,7 +826,10 @@ class SpatialSimulator:
             "alteration_config": kwargs.get("alteration_config"),
             "simulation_mode": kwargs.get("simulation_mode", "generative"),
             "quantile_calibration": kwargs.get("quantile_calibration"),
+            "decode_method": kwargs.get("decode_method", "quantile"),
+            "assignment_method": kwargs.get("assignment_method", "hybrid_ot"),
             "random_seed": kwargs.get("random_seed"),
+            "hybrid_alpha": kwargs.get("hybrid_alpha", 0.2),
         }
         self.fit_model(**fit_kwargs)
         simulated = self.simulate(
@@ -843,31 +843,36 @@ class SpatialSimulator:
         return simulated
     
 
-def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, simulation_mode: str = 'generative', quantile_calibration=None, random_seed: int = None, hybrid_alpha: float = 0.2) -> ad.AnnData:
+def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, simulation_mode: str = 'generative', quantile_calibration=None, decode_method: str = 'quantile', assignment_method: str = 'hybrid_ot', random_seed: int = None, hybrid_alpha: float = 0.2) -> ad.AnnData:
     """
     Run single-slice simulation with explicit generative or empirical semantics.
-    
+
     Args:
         boundary_multiplier (float): Multiplier for maximum count boundary constraint (default 1.1 = 110% of reference max).
-            - 1.0: Strict boundary at reference maximum
-            - 1.1: Allow 10% overshoot (default)
-            - 1.5: Allow 50% overshoot for more variation
-            - 2.0: Allow 100% overshoot for high variation
         alteration_config (AlterationConfig or dict, optional): Configuration for altering marginal distributions.
-            Example:
-                from FEAST.modeling.marginal_alteration import AlterationConfig
-                config = AlterationConfig(
-                    mean_fold_change=2.0,      # Double gene expression means
-                    variance_fold_change=1.5,  # Increase variance by 50%
-                    apply_to_mean=True,
-                    apply_to_variance=True
-                )
         simulation_mode: "generative" by default, or "empirical" for strict controlled alteration.
-        quantile_calibration: "raw" for iid uniform quantiles, "reference_rank" for reference-ranked quantiles,
-            or "auto" to use the mode default.
-        random_seed: Optional seed for reproducible generative sampling and quantile decoding.
-        Other parameters: See individual parameter documentation in fit_model() and simulate() methods.
+        quantile_calibration: Deprecated. Only 'reference_rank' is supported. Passing 'raw' raises an error.
+        decode_method: Deprecated. Count decoding is always rank-based now.
+        random_seed: Optional seed for reproducible generative sampling.
     """
+    if quantile_calibration is not None:
+        qc = str(quantile_calibration).lower().strip()
+        if qc in ('raw', 'iid', 'uniform'):
+            raise ValueError(
+                "quantile_calibration='raw' has been removed. "
+                "Use quantile_calibration='reference_rank' (or omit)."
+            )
+        warnings.warn(
+            "quantile_calibration is deprecated and ignored; count decoding is always rank-based.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    if decode_method != 'quantile':
+        warnings.warn(
+            "decode_method is deprecated and ignored; count decoding is always rank-based.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
     simulation_mode = resolve_simulation_mode(simulation_mode)
     if verbose: print("Starting comprehensive single slice simulation...")
     adata = adata.copy()
@@ -884,6 +889,8 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
         'n_jobs': n_jobs,
         'simulation_mode': simulation_mode,
         'quantile_calibration': quantile_calibration,
+        'decode_method': decode_method,
+        'assignment_method': assignment_method,
         'random_seed': random_seed,
         'hybrid_alpha': hybrid_alpha,
     }

@@ -314,6 +314,7 @@ class GeneParameterSimulator:
         simulation_mode='generative',
         assignment_weights=None,
         random_seed=None,
+        assignment_method='hybrid_ot',
         overgeneration_factor=2.0,
         verbose=True,
     ):
@@ -350,20 +351,29 @@ class GeneParameterSimulator:
         )
         requested = apply_alteration_to_stats(sampled_params, config)
         projected, feasibility = project_stats_to_feasible_domain(requested)
-        assigned = self.assign_to_genes(
-            projected,
-            weights=assignment_weights or {'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0},
-            random_seed=random_seed or 42,
-            verbose=verbose,
-            hybrid_alpha=getattr(self, 'hybrid_alpha', 0.2),
-        )
-        assignment_diag = {'assignment_method': 'hybrid_ot',
-                           'hybrid_alpha': getattr(self, 'hybrid_alpha', 0.2),
-                           'weights': assignment_weights or {'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0}}
+        if assignment_method == 'copula_rank_ot':
+            assigned, assignment_diag = self.assign_to_genes_copula_rank(
+                projected,
+                sampled_u,
+                weights=assignment_weights or {'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0},
+                random_seed=random_seed,
+                verbose=verbose,
+            )
+        else:
+            assigned = self.assign_to_genes(
+                projected,
+                weights=assignment_weights or {'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0},
+                random_seed=random_seed or 42,
+                verbose=verbose,
+                hybrid_alpha=getattr(self, 'hybrid_alpha', 0.2),
+            )
+            assignment_diag = {'assignment_method': 'hybrid_ot',
+                               'hybrid_alpha': getattr(self, 'hybrid_alpha', 0.2),
+                               'weights': assignment_weights or {'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0}}
         diagnostics = {
             'simulation_mode': 'generative',
             'gene_parameter_engine': 'generative',
-            'assignment_method': 'log10_scaled_ot',
+            'assignment_method': assignment_method,
             'requested_config': alteration_config_to_dict(config),
             'target_fold_change': alteration_config_to_dict(config),
             'target_stage_achieved_change': calculate_fold_change(self.original_stats, assigned),

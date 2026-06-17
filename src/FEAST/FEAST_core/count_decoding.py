@@ -1,34 +1,13 @@
-"""Shared count decoding helpers for FEAST simulation."""
+"""Rank-based count decoding for FEAST simulation.
+
+Single pipeline: generate_count_bag_from_model_params() -> np.sort() -> assign by argsort(quantiles).
+"""
 
 from __future__ import annotations
 
 from typing import Optional
 
 import numpy as np
-from scipy.stats import nbinom, poisson
-
-
-COUNT_DECODE_METHODS = ("rank", "quantile")
-QUANTILE_CALIBRATIONS = ("rank", "raw")
-
-
-def resolve_decode_method(decode_method: str, *, allow_auto: bool = False) -> str:
-    """Normalize and validate a FEAST count decoding method."""
-    method = str(decode_method).lower().strip()
-    if method == "auto" and allow_auto:
-        return "quantile"
-    if method not in COUNT_DECODE_METHODS:
-        allowed = "{'auto', 'rank', 'quantile'}" if allow_auto else "{'rank', 'quantile'}"
-        raise ValueError(f"decode_method must be one of {allowed}.")
-    return method
-
-
-def resolve_quantile_calibration(quantile_calibration: str) -> str:
-    """Normalize and validate quantile calibration mode."""
-    calibration = str(quantile_calibration).lower().strip()
-    if calibration not in QUANTILE_CALIBRATIONS:
-        raise ValueError("quantile_calibration must be 'rank' or 'raw'.")
-    return calibration
 
 
 def _dense_array(X, dtype=None) -> Optional[np.ndarray]:
@@ -121,21 +100,23 @@ def generate_count_bag_from_model_params(
     return counts
 
 
-def decode_counts_from_quantiles(
+def decode_counts_by_rank(
     quantiles: np.ndarray,
     model_params: dict,
     *,
-    method: str = "quantile",
-    quantile_calibration: str = "rank",
     spot_weights: Optional[np.ndarray] = None,
     boundary_multiplier: float = 1.1,
     reference_X=None,
     random_seed: Optional[int] = None,
     show_progress: bool = False,
 ) -> np.ndarray:
-    """Decode FEAST model parameters into counts from spot-level quantiles."""
-    method = resolve_decode_method(method)
-    quantile_calibration = resolve_quantile_calibration(quantile_calibration)
+    """Decode counts from rank-ordered quantile positions.
+
+    For each gene:
+      1. Stochastically sample a count bag from the fitted model params.
+      2. Sort the bag.
+      3. Assign to spots by argsort(quantiles[:, gene]).
+    """
     quantiles = np.asarray(quantiles, dtype=np.float64)
     if quantiles.ndim != 2:
         raise ValueError("quantiles must be a 2D array.")
@@ -143,6 +124,14 @@ def decode_counts_from_quantiles(
     n_spots, n_genes = quantiles.shape
     if n_spots == 0:
         return np.zeros((0, n_genes), dtype=np.int32)
+
+    raw_counts = generate_count_bag_from_model_params(
+        model_params,
+        n_spots,
+        boundary_multiplier=boundary_multiplier,
+        reference_X=reference_X,
+        random_seed=random_seed,
+    )
 
     final_counts = np.zeros((n_spots, n_genes), dtype=np.float32)
 
@@ -155,77 +144,26 @@ def decode_counts_from_quantiles(
     else:
         weights = None
 
+    q_positions = np.linspace(0.0, 1.0, n_spots, dtype=np.float64)
+
     iterator = range(n_genes)
     if show_progress:
         from tqdm import tqdm
 
         iterator = tqdm(iterator)
 
-    q_positions = np.linspace(0.0, 1.0, n_spots, dtype=np.float64)
-
-    if method == "rank":
-        raw_counts = generate_count_bag_from_model_params(
-            model_params,
-            n_spots,
-            boundary_multiplier=boundary_multiplier,
-            reference_X=reference_X,
-            random_seed=random_seed,
-        )
-        for gene_idx in iterator:
-            gene_counts_bag = np.sort(raw_counts[:, gene_idx])
-            spot_rank_order = np.argsort(quantiles[:, gene_idx])
-            if weights is None:
+    for gene_idx in iterator:
+        gene_counts_bag = np.sort(raw_counts[:, gene_idx])
+        spot_rank_order = np.argsort(quantiles[:, gene_idx])
+        if weights is None:
+            final_counts[spot_rank_order, gene_idx] = gene_counts_bag
+        else:
+            w_ordered = weights[spot_rank_order]
+            cum_w = np.cumsum(w_ordered)
+            if cum_w[-1] <= 0:
                 final_counts[spot_rank_order, gene_idx] = gene_counts_bag
             else:
-                w_ordered = weights[spot_rank_order]
-                cum_w = np.cumsum(w_ordered)
-                if cum_w[-1] <= 0:
-                    final_counts[spot_rank_order, gene_idx] = gene_counts_bag
-                else:
-                    q_w = (cum_w - 0.5 * w_ordered) / cum_w[-1]
-                    final_counts[spot_rank_order, gene_idx] = np.interp(q_w, q_positions, gene_counts_bag)
-        return np.rint(final_counts).astype(np.int32)
-
-    boundary = _boundary_per_gene(reference_X, n_genes, model_params, boundary_multiplier)
-    for gene_idx in iterator:
-        if weights is None:
-            if quantile_calibration == "rank":
-                order = np.argsort(quantiles[:, gene_idx], kind="mergesort")
-                q = np.empty(n_spots, dtype=np.float64)
-                q[order] = (np.arange(n_spots, dtype=np.float64) + 0.5) / float(n_spots)
-            else:
-                q = np.asarray(quantiles[:, gene_idx], dtype=np.float64)
-            q = np.clip(q, 1e-6, 1.0 - 1e-6)
-        else:
-            order = np.argsort(quantiles[:, gene_idx])
-            w_ordered = weights[order]
-            cum_w = np.cumsum(w_ordered)
-            q_w = (cum_w - 0.5 * w_ordered) / cum_w[-1] if cum_w[-1] > 0 else q_positions
-            q = np.empty_like(q_w)
-            q[order] = q_w
-            q = np.clip(q, 1e-6, 1.0 - 1e-6)
-
-        model_type, pi0, r, mu = _model_type_and_params(model_params, gene_idx)
-        if model_type == "Poisson":
-            counts = poisson.ppf(q, mu)
-        elif model_type == "NB":
-            p = r / (r + mu)
-            counts = nbinom.ppf(q, r, p)
-        elif model_type == "ZIP":
-            q_adj = np.clip((q - pi0) / max(1e-8, 1.0 - pi0), 0.0, 1.0)
-            counts = poisson.ppf(q_adj, mu)
-            counts[q <= pi0] = 0
-        elif model_type == "ZINB":
-            p = r / (r + mu)
-            q_adj = np.clip((q - pi0) / max(1e-8, 1.0 - pi0), 0.0, 1.0)
-            counts = nbinom.ppf(q_adj, r, p)
-            counts[q <= pi0] = 0
-        else:
-            counts = poisson.ppf(q, mu)
-
-        gene_boundary = boundary[gene_idx]
-        if np.isfinite(gene_boundary):
-            counts = np.minimum(counts, gene_boundary)
-        final_counts[:, gene_idx] = counts
+                q_w = (cum_w - 0.5 * w_ordered) / cum_w[-1]
+                final_counts[spot_rank_order, gene_idx] = np.interp(q_w, q_positions, gene_counts_bag)
 
     return np.rint(final_counts).astype(np.int32)

@@ -7,12 +7,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Union
 import anndata as ad
 import numpy as np
 import pandas as pd
-import torch
 from sklearn.neighbors import NearestNeighbors
 
-from ..FEAST_core.count_decoding import decode_counts_from_quantiles, resolve_decode_method
+from ..FEAST_core.count_decoding import decode_counts_by_rank
 from ._metadata import records_by_label_to_h5ad_uns
-from ._transport import log_sinkhorn
+from ._ot_transport import sinkhorn_transport
 from .core import SliceBlueprint, active_mask_metadata, assign_generated_coordinates, load_blueprint
 from .pattern import diffuse_quantile_map
 from .quantile_field import (
@@ -48,10 +47,6 @@ class SimulationConfig:
     geometry_weight: float = 1.0
     boundary_weight: float = 0.25
     reference_weight_eta: float = 4.0
-    torch_device: str = "cpu"
-    torch_dtype: str = "float32"
-    decode_method: str = "auto"
-    quantile_calibration: str = "rank"
     boundary_multiplier: float = 1.1
     diffusion_level: float = 0.0
     boundary_softness: float = 0.0
@@ -367,12 +362,11 @@ def simulate_from_reference(
         float(gen_cfg.diffusion_level),
     ).astype(np.float32, copy=False)
 
-    decode_method = resolve_decode_method(gen_cfg.decode_method, allow_auto=True)
     for label in unique_labels:
         target_mask = target_labels == label
         label_q = quantiles[target_mask, :]
         eligible_refs = [ref for ref in model.references if label in ref.labels]
-        if decode_method == "rank" and parameter_cloud is None:
+        if parameter_cloud is None:
             decoded = _decode_label_aware_rank_counts(
                 quantiles=label_q,
                 label=label,
@@ -380,15 +374,12 @@ def simulate_from_reference(
                 gene_names=model.gene_names,
                 eligible_refs=eligible_refs,
                 reference_weights=label_weights_out[label],
-                quantile_calibration=str(gen_cfg.quantile_calibration),
             )
         else:
             model_params = _stats_frame_to_model_params(label_clouds[label])
-            decoded = decode_counts_from_quantiles(
+            decoded = decode_counts_by_rank(
                 label_q,
                 model_params,
-                method=decode_method,
-                quantile_calibration=str(gen_cfg.quantile_calibration),
                 boundary_multiplier=float(gen_cfg.boundary_multiplier),
                 random_seed=int(random_seed),
                 show_progress=bool(gen_cfg.verbose),
@@ -434,8 +425,8 @@ def simulate_from_reference(
         "transport_weights": label_weights_out,
         "transport_diagnostics": records_by_label_to_h5ad_uns(transport_diagnostics),
         "parameter_cloud_summary": label_cloud_out,
-        "decode_method": decode_method,
-        "quantile_calibration": str(gen_cfg.quantile_calibration),
+        "decode_method": "rank",
+        "quantile_calibration": "reference_rank",
         "diffusion_level": float(gen_cfg.diffusion_level),
         "boundary_softness": float(gen_cfg.boundary_softness),
         "assignment_randomness": float(gen_cfg.assignment_randomness),
@@ -747,19 +738,17 @@ def _solve_label_transport(
     a = np.full(source_coords.shape[0], 1.0 / source_coords.shape[0], dtype=np.float32)
     b = np.full(target_coords.shape[0], 1.0 / target_coords.shape[0], dtype=np.float32)
 
-    dtype = torch.float64 if str(config.torch_dtype).lower() == "float64" else torch.float32
-    device = torch.device(str(config.torch_device))
-    plan = log_sinkhorn(
-        C=torch.as_tensor(cost, dtype=dtype, device=device),
-        a=torch.as_tensor(a, dtype=dtype, device=device),
-        b=torch.as_tensor(b, dtype=dtype, device=device),
-        epsilon=float(config.epsilon),
-        n_iter=int(config.sinkhorn_iter),
-        tol=float(config.sinkhorn_tol),
+    plan = sinkhorn_transport(
+        M=cost,
+        a=a,
+        b=b,
+        reg=float(config.epsilon),
+        numItermax=int(config.sinkhorn_iter),
+        stopThr=float(config.sinkhorn_tol),
         unbalanced=bool(config.unbalanced_transport),
         reg_m=float(config.reg_m),
     )
-    return plan.detach().cpu().numpy().astype(np.float32, copy=False)
+    return plan
 
 
 def _transport_reference_latent_scores(
@@ -807,11 +796,8 @@ def _decode_label_aware_rank_counts(
     gene_names: Sequence[str],
     eligible_refs: Sequence[ReferenceSliceData],
     reference_weights: Mapping[str, float],
-    quantile_calibration: str,
 ) -> np.ndarray:
-    if str(quantile_calibration).lower().strip() not in {"rank", "raw"}:
-        raise ValueError("quantile_calibration must be 'rank' or 'raw'")
-
+    """Decode counts via rank-preserving assignment against reference data."""
     quantiles = np.asarray(quantiles, dtype=np.float64)
     n_spots, n_genes = quantiles.shape
     counts = np.zeros((n_spots, n_genes), dtype=np.int32)
@@ -856,12 +842,9 @@ def _decode_label_aware_rank_counts(
         cdf = np.cumsum(weights)
         cdf[-1] = 1.0
 
-        if str(quantile_calibration).lower().strip() == "rank":
-            target_order = np.argsort(quantiles[:, gene_idx], kind="mergesort")
-            q = np.empty(n_spots, dtype=np.float64)
-            q[target_order] = q_positions
-        else:
-            q = np.asarray(quantiles[:, gene_idx], dtype=np.float64)
+        target_order = np.argsort(quantiles[:, gene_idx], kind="mergesort")
+        q = np.empty(n_spots, dtype=np.float64)
+        q[target_order] = q_positions
         q = np.clip(q, 1e-12, 1.0)
         selected = np.searchsorted(cdf, q, side="left")
         selected = np.clip(selected, 0, values.size - 1)
