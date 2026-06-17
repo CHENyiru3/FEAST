@@ -1,9 +1,0 @@
-# Generated h5ad files (too large for git)
-*.h5ad
-
-# Large regularized output CSVs (exceeds GitHub 100MB limit)
-z_regularized_class_means.csv
-
-# Python cache
-__pycache__/
-*.pyc

@@ -1,8 +1,0 @@
-simulation_id,type,angle,file_path,n_spots,n_genes,seed,expression_mode
-original,original,0,reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/original.h5ad,3565,13712,2026,generative
-rotated_1,rotated,1.0,reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/rotated_1.h5ad,3549,13712,2026,generative
-rotated_5,rotated,5.0,reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/rotated_5.h5ad,3410,13712,2026,generative
-rotated_10,rotated,10.0,reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/rotated_10.h5ad,2892,13712,2026,generative
-rotated_30,rotated,30.0,reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/rotated_30.h5ad,1179,13712,2026,generative
-rotated_45,rotated,45.0,reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/rotated_45.h5ad,333,13712,2026,generative
-rotated_60,rotated,60.0,reproduction/3_Alignment_simulation/alignment_rerun_20260614/simulations/rotated_60.h5ad,0,13712,2026,generative
