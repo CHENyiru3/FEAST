@@ -17,6 +17,7 @@ from .parameter_cloud import (
 
 PARAMETER_MODES = ("hungarian", "reference_stats")
 SPATIAL_MODES = ("reference_rank", "ot_spatial")
+MAX_DENSE_OT_SPOTS = 50_000
 
 # Internal translation: public parameter_mode ↔ internal simulation_mode
 _PARAMETER_TO_SIMULATION = {"hungarian": "generative", "reference_stats": "empirical"}
@@ -254,18 +255,51 @@ class SpatialSimulator:
                 n_genes = len(common_genes)
 
             source_coords = reference_adata.obsm['spatial']
-            cost = cdist(source_coords, target_coords, metric='euclidean')
-            a = np.ones(n_spots) / n_spots
-            b = np.ones(n_target) / n_target
 
-            from ..de_novo._ot_transport import sinkhorn_transport
-            plan = sinkhorn_transport(M=cost, a=a, b=b, reg=0.05)
-            transported = plan.T @ reference_matrix
+            if n_spots > MAX_DENSE_OT_SPOTS or n_target > MAX_DENSE_OT_SPOTS:
+                # Use block OT for large datasets
+                transported = _block_ot_transport(
+                    reference_matrix, source_coords, target_coords, reg=0.05
+                )
+                spatial_coords = target_coords.copy()
+                reference_for_clip = reference_matrix
+                n_spots = n_target
+                quantile_input = transported
+            else:
+                cost = cdist(source_coords, target_coords, metric='euclidean')
+                a = np.ones(n_spots) / n_spots
+                b = np.ones(n_target) / n_target
 
-            spatial_coords = target_coords.copy()
-            reference_for_clip = reference_matrix
-            n_spots = n_target
-            quantile_input = transported
+                from ..de_novo._ot_transport import sinkhorn_transport
+                from ..de_novo.quantile_field import midpoint_rank_normalize
+
+                plan = sinkhorn_transport(M=cost, a=a, b=b, reg=0.05)
+
+                # Convert reference counts to rank quantiles per gene — puts all genes
+                # on [0,1] scale so transport is unbiased by expression magnitude.
+                ref_quantiles = midpoint_rank_normalize(
+                    reference_matrix,
+                    tie_policy='stable_ordinal',
+                    clip_eps=1e-6,
+                )
+
+                # Column-normalize the plan and transport RANK QUANTILES (not raw counts).
+                col_mass = plan.sum(axis=0, keepdims=True)
+                safe_mass = np.where(col_mass > 1e-12, col_mass, 1.0)
+                transported = (plan / safe_mass).T @ ref_quantiles
+
+                # Rank-normalize transported scores back to [0,1] — fixes
+                # variance compression from the OT weighted average.
+                transported = midpoint_rank_normalize(
+                    transported,
+                    tie_policy='stable_ordinal',
+                    clip_eps=1e-6,
+                )
+
+                spatial_coords = target_coords.copy()
+                reference_for_clip = reference_matrix
+                n_spots = n_target
+                quantile_input = transported
         else:
             spatial_coords = reference_adata.obsm['spatial']
             reference_for_clip = reference_matrix
@@ -857,10 +891,88 @@ class SpatialSimulator:
             boundary_multiplier=kwargs.get("boundary_multiplier", 1.1),
             random_seed=kwargs.get("random_seed"),
             spatial_mode=kwargs.get("spatial_mode", "reference_rank"),
+            target_adata=kwargs.get("target_adata"),
         )
         simulated.uns["annotation_key"] = annotation_key
         return simulated
     
+
+def _block_ot_transport(reference_matrix, source_coords, target_coords, reg=0.05, block_size=40000, overlap_frac=0.25):
+    """Block-based optimal transport for large datasets.
+
+    Partitions target space into grid tiles, computes OT per tile with
+    overlap, and assembles results.  Uncovered spots fall back to
+    nearest-neighbour assignment.  Avoids the O(n^2) dense cost matrix
+    that would OOM for Xenium-scale (> 100k spots) datasets.
+    """
+    from ..de_novo._ot_transport import sinkhorn_transport
+    from ..de_novo.quantile_field import midpoint_rank_normalize
+
+    n_source = source_coords.shape[0]
+    n_target = target_coords.shape[0]
+
+    ref_quantiles = midpoint_rank_normalize(reference_matrix, tie_policy='stable_ordinal', clip_eps=1e-6)
+
+    tgt_x, tgt_y = target_coords[:, 0], target_coords[:, 1]
+    src_x, src_y = source_coords[:, 0], source_coords[:, 1]
+
+    x_min, x_max = tgt_x.min(), tgt_x.max()
+    y_min, y_max = tgt_y.min(), tgt_y.max()
+    x_range = x_max - x_min or 1.0
+    y_range = y_max - y_min or 1.0
+
+    n_tiles = max(1, int(np.ceil(np.sqrt(n_target / max(1, block_size)))))
+    x_edges = np.linspace(x_min, x_max, n_tiles + 1)
+    y_edges = np.linspace(y_min, y_max, n_tiles + 1)
+    x_overlap = overlap_frac * (x_range / n_tiles)
+    y_overlap = overlap_frac * (y_range / n_tiles)
+
+    transported_accum = np.zeros((n_target, reference_matrix.shape[1]), dtype=np.float64)
+    count_accum = np.zeros(n_target, dtype=np.float64)
+
+    for ix in range(n_tiles):
+        for iy in range(n_tiles):
+            xl = max(x_min, x_edges[ix] - x_overlap)
+            xr = min(x_max, x_edges[ix + 1] + x_overlap)
+            yl = max(y_min, y_edges[iy] - y_overlap)
+            yr = min(y_max, y_edges[iy + 1] + y_overlap)
+
+            tgt_mask = (tgt_x >= xl) & (tgt_x <= xr) & (tgt_y >= yl) & (tgt_y <= yr)
+            tgt_idx = np.where(tgt_mask)[0]
+            if len(tgt_idx) < 5:
+                continue
+
+            src_mask = (src_x >= xl) & (src_x <= xr) & (src_y >= yl) & (src_y <= yr)
+            src_idx = np.where(src_mask)[0]
+            if len(src_idx) < 5:
+                continue
+
+            cost = cdist(source_coords[src_idx], target_coords[tgt_idx], metric='euclidean')
+            a = np.ones(len(src_idx)) / n_source
+            b = np.ones(len(tgt_idx)) / n_target
+
+            plan = sinkhorn_transport(M=cost, a=a, b=b, reg=reg)
+
+            col_mass = plan.sum(axis=0, keepdims=True)
+            safe_mass = np.where(col_mass > 1e-12, col_mass, 1.0)
+            transported_local = (plan / safe_mass).T @ ref_quantiles[src_idx, :]
+
+            transported_accum[tgt_idx, :] += transported_local
+            count_accum[tgt_idx] += 1
+
+    uncovered = count_accum == 0
+    if np.any(uncovered):
+        uncovered_idx = np.where(uncovered)[0]
+        dist_all = cdist(target_coords[uncovered_idx], source_coords, metric='euclidean')
+        nearest_src = np.argmin(dist_all, axis=1)
+        transported_accum[uncovered_idx, :] = ref_quantiles[nearest_src, :]
+        count_accum[uncovered_idx] = 1.0
+
+    transported = transported_accum / count_accum[:, None]
+
+    transported = midpoint_rank_normalize(transported, tie_policy='stable_ordinal', clip_eps=1e-6)
+    return transported
+
 
 def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, parameter_mode: str = 'hungarian', spatial_mode: str = 'reference_rank', target_adata=None, assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2) -> ad.AnnData:
     """
@@ -912,13 +1024,14 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
         if use_real_stats_directly: print("Warning: `use_real_stats_directly` is not implemented for annotation-based simulation. Running standard simulation.")
         if verbose: print(f"Using annotation-based simulation with key: '{annotation_key}'")
         simulated_adata = simulator.simulate_by_annotation(
-            annotation_key=annotation_key, 
-            visualize_fits=visualize_fits, 
-            num_simulation_cores=num_simulation_cores, 
-            verbose=verbose, 
-            clip_overshoot_factor=clip_overshoot_factor, 
+            annotation_key=annotation_key,
+            visualize_fits=visualize_fits,
+            num_simulation_cores=num_simulation_cores,
+            verbose=verbose,
+            clip_overshoot_factor=clip_overshoot_factor,
             boundary_multiplier=boundary_multiplier,
             alteration_config=alteration_config,
+            target_adata=target_adata,
             **heuristic_kwargs, # Pass all heuristic controls
         )
 
