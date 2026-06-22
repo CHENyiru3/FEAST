@@ -640,13 +640,16 @@ def _estimate_zip_by_moment_optimization(mu_total, var_total, zero_prop,
     else:
         pi0, lam = initial_guess[0], initial_guess[1]
 
+    if n_spots is not None:
+        pi0, lam = _finite_sample_correct_zip(pi0, lam, target_stats, n_spots, boundary)
+
     return {'pi0': pi0, 'lambda': lam}
 
 
 def _finite_sample_correct_zip(pi0, lam, target_stats, n_spots, boundary=None):
     """Adjust ZIP params so realized finite-sample moments match targets."""
     target_mean, target_var, target_zero = target_stats
-    for _ in range(3):
+    for _ in range(10):
         zero_mask = np.random.random(n_spots) < pi0
         counts = np.random.poisson(lam, size=n_spots)
         counts[zero_mask] = 0
@@ -661,9 +664,9 @@ def _finite_sample_correct_zip(pi0, lam, target_stats, n_spots, boundary=None):
         if real_mean > 0 and target_mean > 0:
             lam = max(lam * (target_mean / real_mean), 1e-8)
         if real_zero < target_zero:
-            pi0 = min(pi0 + 0.05 * (target_zero - real_zero), 0.99)
+            pi0 = min(pi0 + 0.10 * (target_zero - real_zero), 0.99)
         elif real_zero > target_zero:
-            pi0 = max(pi0 - 0.05 * (real_zero - target_zero), 0.0)
+            pi0 = max(pi0 - 0.10 * (real_zero - target_zero), 0.0)
     return pi0, lam
 
 def _estimate_zinb_by_moment_optimization(mu_total, var_total, zero_prop,
@@ -692,13 +695,16 @@ def _estimate_zinb_by_moment_optimization(mu_total, var_total, zero_prop,
     else:
         pi0, mu, r = initial_guess[0], initial_guess[1], initial_guess[2]
 
+    if n_spots is not None:
+        pi0, mu, r = _finite_sample_correct_zinb(pi0, mu, r, target_stats, n_spots, boundary)
+
     return {'pi0': pi0, 'mu': mu, 'r': r}
 
 
 def _finite_sample_correct_zinb(pi0, mu, r, target_stats, n_spots, boundary=None):
     """Adjust ZINB params so realized finite-sample moments match targets."""
     target_mean, target_var, target_zero = target_stats
-    for _ in range(3):
+    for _ in range(10):
         zero_mask = np.random.random(n_spots) < pi0
         p = r / (r + mu)
         counts = np.random.negative_binomial(r, np.clip(p, 1e-8, 1 - 1e-8), size=n_spots)
@@ -721,13 +727,13 @@ def _finite_sample_correct_zinb(pi0, mu, r, target_stats, n_spots, boundary=None
                 r = r * (2.0 - var_ratio)
             r = max(r, 1e-8)
         if real_zero < target_zero:
-            pi0 = min(pi0 + 0.05 * (target_zero - real_zero), 0.99)
+            pi0 = min(pi0 + 0.10 * (target_zero - real_zero), 0.99)
         elif real_zero > target_zero:
-            pi0 = max(pi0 - 0.05 * (real_zero - target_zero), 0.0)
+            pi0 = max(pi0 - 0.10 * (real_zero - target_zero), 0.0)
     return pi0, mu, r
 
 def _select_model_with_heuristic(mu_total, var_total, zero_prop,
-                                 zero_tolerance=0.05, overdispersion_threshold=1.5):
+                                 zero_tolerance=0.01, overdispersion_threshold=1.5):
     """Select count model using excess-zero logic, not raw zero proportion.
 
     High zero proportion is normal for low-expression genes (Poisson mean=0.2

@@ -25,6 +25,18 @@ from .pattern import (
 )
 from .quantile_field import QuantileFieldConfig
 from .stack import simulate_stack
+from .z_regularize import (
+    calibrate_counts_to_regularized_means,
+    class_anchor_weight,
+    compute_z_coherence,
+    regularize_mean_profiles,
+    summarize_z_coherence_frame,
+    z_penalty_matrix,
+)
+from .z_spot_smooth import (
+    compute_spot_z_autocorrelation,
+    smooth_cross_z_spots,
+)
 
 __all__ = [
     "SimulationBlueprint",
@@ -35,16 +47,24 @@ __all__ = [
     "SimulationReference",
     "SimulationConfig",
     "QuantileFieldConfig",
+    "calibrate_counts_to_regularized_means",
+    "class_anchor_weight",
+    "compute_spot_z_autocorrelation",
     "compose_pattern",
+    "compute_z_coherence",
     "evaluate_motif",
     "fit_reference",
-    "simulate_from_reference",
-    "simulate_stack",
-    "simulate_from_design",
     "load_blueprint",
+    "plot_blueprint",
     "plot_pattern",
     "plot_pattern_panel",
-    "plot_blueprint",
+    "regularize_mean_profiles",
+    "simulate_from_design",
+    "simulate_from_reference",
+    "simulate_stack",
+    "smooth_cross_z_spots",
+    "summarize_z_coherence_frame",
+    "z_penalty_matrix",
 ]
 
 
