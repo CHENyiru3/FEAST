@@ -15,15 +15,9 @@ import anndata as ad
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 _GENE_CHUNK_SIZE = 512
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 def _dense_from_adata(adata: ad.AnnData, layer: Optional[str] = None) -> np.ndarray:
@@ -115,9 +109,6 @@ def _estimate_median_nn_dist(coords: np.ndarray) -> float:
     return float(np.median(dists[:, col]))
 
 
-# ---------------------------------------------------------------------------
-# Core per-slice smoothing
-# ---------------------------------------------------------------------------
 
 
 def _smooth_one_slice(
@@ -257,9 +248,6 @@ def _smooth_one_slice(
     return np.rint(np.clip(blended, 0.0, None)).astype(np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 
 def smooth_cross_z_spots(
@@ -441,9 +429,6 @@ def smooth_cross_z_spots(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Z-autocorrelation
-# ---------------------------------------------------------------------------
 
 
 def compute_spot_z_autocorrelation(

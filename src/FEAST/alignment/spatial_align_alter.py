@@ -18,13 +18,6 @@ class SpatialTransformer:
         """Apply transformation. Must be implemented by subclasses."""
         raise NotImplementedError("Subclasses must implement transform()")
     
-    def _minimal_internal_space(self, points):
-        """Calculate minimum distance between any two points."""
-        min_distance = float('inf')
-        kdtree = scipy.spatial.KDTree(points)
-        distances, _ = kdtree.query(points, k=2)
-        return np.min(distances[:, 1])  # Second nearest neighbor (first is self)
-    
     def cut(self, x_min, x_max, y_min, y_max):
         """Cut a rectangular section from the spatial data."""
         mask = (
@@ -35,21 +28,17 @@ class SpatialTransformer:
         return adata_cut
     
     def move(self, dx, dy):
-        # Get original boundaries
         x_min, x_max = np.min(self.adata.obsm['spatial'][:, 0]), np.max(self.adata.obsm['spatial'][:, 0])
         y_min, y_max = np.min(self.adata.obsm['spatial'][:, 1]), np.max(self.adata.obsm['spatial'][:, 1])
         
-        # Create a copy and move coordinates
         moved_adata = self.adata.copy()
         moved_coords = self.spatial_data + np.array([dx, dy])
         
-        # Create mask for spots that remain within original boundaries
         in_bounds = (
             (moved_coords[:, 0] >= x_min) & (moved_coords[:, 0] <= x_max) &
             (moved_coords[:, 1] >= y_min) & (moved_coords[:, 1] <= y_max)
         )
         
-        # Filter the AnnData object and update spatial coordinates
         moved_adata = moved_adata[in_bounds].copy()
         moved_adata.obsm['spatial'] = moved_coords[in_bounds]
         
@@ -198,7 +187,6 @@ class RotationTransformer:
         """
         print(f"Transforming sequencing-based data with {self.spatial_data.shape[0]} spots")
         
-        # Get spatial bounds
         x_coords = self.spatial_data[:, 0]
         y_coords = self.spatial_data[:, 1]
         min_x, max_x = np.min(x_coords), np.max(x_coords)
@@ -209,7 +197,6 @@ class RotationTransformer:
         if min_space is None:
             from scipy.spatial import distance_matrix
             
-            # Calculate pairwise distances for a subset of points
             sample_size = min(1000, len(self.spatial_data))
             indices = np.random.choice(len(self.spatial_data), size=sample_size, replace=False)
             sampled_coords = self.spatial_data[indices]
@@ -219,11 +206,9 @@ class RotationTransformer:
             min_space = np.min(dist_matrix)
             print(f"Calculated minimal spacing: {min_space}")
         
-        # Calculate grid parameters
         spacing = min_space / 2
         offset = min_space * np.sqrt(3) / 2
         
-        # Estimate grid size
         rows_full = round((y_range[1] - y_range[0]) / offset) + 1
         cols_full = round((x_range[1] - x_range[0]) / (spacing * 2)) + 1
         estimated_grid_size = rows_full * cols_full
@@ -234,7 +219,6 @@ class RotationTransformer:
         print(f"Generating grid with {rows}x{cols}={rows*cols} points")
         grid = self._generate_offset_grid(rows, cols, spacing, offset, x_range, y_range)
         
-        # Rotate the coordinates
         print(f"Rotating spots by {rotation_angle} degrees")
         rotated_spots = self._rotate(self.spatial_data, rotation_angle, center_correction)
         
@@ -242,7 +226,6 @@ class RotationTransformer:
         nearest_indices = self._find_nearest_grid_points(rotated_spots, grid)
         new_spots = grid[nearest_indices]
         
-        # Remove duplicates
         print("Removing duplicates")
         seen = {}
         mapping = []
@@ -290,14 +273,11 @@ class RotationTransformer:
         """
         print(f"Transforming imaging-based data with {self.spatial_data.shape[0]} spots")
         
-        # Get original bounds
         original_bounds = self._get_spatial_bounds(self.spatial_data)
         
-        # Rotate the coordinates
         print(f"Rotating spots by {rotation_angle} degrees")
         rotated_spots = self._rotate(self.spatial_data, rotation_angle, center_correction)
         
-        # Filter points if needed
         if keep_bounds:
             print("Filtering spots to keep only those within original bounds")
             in_bounds_mask = self._filter_points_in_range(rotated_spots, original_bounds)
@@ -306,7 +286,6 @@ class RotationTransformer:
         else:
             mapping = np.arange(len(rotated_spots))
         
-        # Create new AnnData object
         print(f"Creating new AnnData with {len(mapping)} spots")
         new_adata = self.adata[mapping, :].copy()
         new_adata.obsm['spatial'] = rotated_spots[mapping]
@@ -408,8 +387,7 @@ class WarpTransformer(SpatialTransformer):
             return warped_adata
             
         except np.linalg.LinAlgError:
-            print("Warning: TPS fitting failed, returning slightly perturbed data")
-            warped_adata = self.adata.copy()
-            perturbed_coords = self.spatial_data + np.random.normal(0, np.ptp(self.spatial_data)/100, self.spatial_data.shape)
-            warped_adata.obsm['spatial'] = perturbed_coords
-            return warped_adata
+            raise np.linalg.LinAlgError(
+                "TPS fitting failed: the control point configuration is degenerate. "
+                "Try reducing distort_level, increasing grid_size, or using different spatial data."
+            )

@@ -183,14 +183,14 @@ class FEAST:
     def simulate_alignment_benchmark(
         self,
         transformations: Optional[List[str]] = None,
-        parameters: Optional[Dict] = None,
-        data_types: Optional[List[str]] = None,
+        fit_params: Optional[Dict] = None,
+        expression_params: Optional[Dict] = None,
     ) -> Dict[str, tuple]:
         return generate_alignment_benchmark_suite(
             self._single_adata("Alignment benchmark"),
             transformations=transformations,
-            parameters=parameters,
-            data_types=data_types,
+            fit_params=fit_params,
+            expression_params=expression_params,
         )
 
     def simulate_deconvolution(

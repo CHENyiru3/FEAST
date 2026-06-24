@@ -2,15 +2,10 @@ import numpy as np
 import pandas as pd
 import scanpy as sc
 import anndata as ad
-import torch
 from scipy.sparse import issparse
 from typing import Optional, Dict, Any, List
 
-# Import core simulation components  
 from ..FEAST_core.simulator import simulate_single_slice
-
-global device   
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 class DeconvolutionSimulator:
@@ -63,7 +58,6 @@ class DeconvolutionSimulator:
             Deconvolution simulation data with aggregated spots and ground truth
         """
             
-        # Stage 1: Generate high-quality simulated slice
         if self.verbose:
             print(f"\n--- Stage 1: Single Slice Simulation ---")
             print(f"Reference data: {reference_adata.shape}")
@@ -82,7 +76,6 @@ class DeconvolutionSimulator:
         if self.verbose:
             print(f"✓ Simulated slice created: {simulated_slice.shape}")
             
-        # Stage 2: Apply spatial downsampling/aggregation
         if self.verbose:
             print(f"\n--- Stage 2: Spatial Aggregation ---")
             print(f"Downsampling factor: {downsampling_factor}")
@@ -135,10 +128,8 @@ class DeconvolutionSimulator:
             calculate_cell_type_proportions_for_lowres
         )
         
-        # Extract spatial coordinates and expression matrix
         original_coords = simulated_adata.obsm['spatial']
         
-        # Convert expression matrix to dense if sparse
         if hasattr(simulated_adata.X, 'toarray'):
             expression_matrix = simulated_adata.X.toarray()
         else:
@@ -147,7 +138,6 @@ class DeconvolutionSimulator:
         if self.verbose:
             print(f"  Creating low-resolution grid...")
             
-        # Generate low-resolution grid
         lowres_grid = create_low_resolution_grid(
             original_coords, 
             downsampling_factor=downsampling_factor,
@@ -157,7 +147,6 @@ class DeconvolutionSimulator:
         if self.verbose:
             print(f"  Initial grid points: {len(lowres_grid)}")
             
-        # Filter grid to tissue shape
         lowres_grid = filter_grid_to_tissue_shape(
             original_coords, 
             lowres_grid, 
@@ -167,13 +156,11 @@ class DeconvolutionSimulator:
         if self.verbose:
             print(f"  Filtered grid points: {len(lowres_grid)}")
             
-        # Assign original spots to low-resolution grid points
         assignments = assign_original_spots_to_grid(original_coords, lowres_grid)
         
         if self.verbose:
             print(f"  Aggregating expression data...")
             
-        # Aggregate gene expression
         aggregated_counts = aggregate_gene_expression(
             expression_matrix, 
             assignments, 
@@ -187,7 +174,6 @@ class DeconvolutionSimulator:
         )
         lowres_adata.obsm['spatial'] = lowres_grid
         
-        # Calculate and store ground truth cell type proportions if available
         if cell_type_key is not None and cell_type_key in simulated_adata.obs:
             if self.verbose:
                 print(f"  Calculating cell type proportions...")
@@ -206,15 +192,12 @@ class DeconvolutionSimulator:
             if self.verbose:
                 print(f"  ✓ Ground truth proportions calculated for {len(proportions_df.columns)} cell types")
         
-        # Store only H5AD-compatible metadata
         lowres_adata.uns['n_assignments'] = int(len(assignments))
         
-        # Copy only simple metadata from original simulation
         for key, value in simulated_adata.uns.items():
             if isinstance(value, (str, int, float, bool, np.integer, np.floating)):
                 lowres_adata.uns[f'original_{key}'] = value
         
-        # Add aggregation metadata (H5AD compatible)
         lowres_adata.uns['aggregation_original_spots'] = int(len(original_coords))
         lowres_adata.uns['aggregation_final_spots'] = int(len(lowres_grid))
         lowres_adata.uns['aggregation_downsampling_factor'] = float(downsampling_factor)

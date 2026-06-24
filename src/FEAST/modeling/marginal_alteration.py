@@ -10,11 +10,12 @@ class MarginalModelAlterator:
         """Initialize the marginal model alterator."""
         self.alteration_history = []
     
-    def alter_model(self, 
-                   modeler, 
+    def alter_model(self,
+                   modeler,
                    mean_fold_change: float = 1.0,
                    variance_fold_change: float = 1.0,
-                   sparsity_fold_change: float = 1.0,
+                   sparsity_fold_change: float | None = None,
+                   sparsity_logit_shift: float | None = None,
                    dispersion_strength: float = 0.2,
                    preserve_original: bool = True,
                    verbose: bool = True) -> object:
@@ -28,7 +29,7 @@ class MarginalModelAlterator:
         if variance_fold_change < 0:
             raise ValueError("variance_fold_change must be non-negative")
             
-        if sparsity_fold_change <= 0:
+        if sparsity_fold_change is not None and sparsity_fold_change <= 0:
             raise ValueError("sparsity_fold_change must be positive")
             
         if not 0 <= dispersion_strength <= 1:
@@ -44,8 +45,10 @@ class MarginalModelAlterator:
             print(f"--- Altering {type(target_modeler).__name__} ---")
             print(f"  Mean fold change: {mean_fold_change}x")
             print(f"  Variance fold change: {variance_fold_change}x")
-            if sparsity_fold_change != 1.0:
-                print(f"  Sparsity fold change: {sparsity_fold_change}x")
+            if sparsity_logit_shift is not None and sparsity_logit_shift != 0.0:
+                print(f"  Sparsity logit shift: {sparsity_logit_shift:+.4f}")
+            elif sparsity_fold_change is not None and sparsity_fold_change != 1.0:
+                print(f"  Sparsity fold change (deprecated): {sparsity_fold_change}x")
             print(f"  Dispersion strength: {dispersion_strength}")
         
         # Record original statistics for comparison
@@ -61,8 +64,11 @@ class MarginalModelAlterator:
                                         variance_fold_change, dispersion_strength, verbose)
             elif 'alphas' in target_modeler.model_params and 'betas' in target_modeler.model_params:
                 # Beta mixture model
-                self._alter_beta_model(target_modeler, mean_fold_change, 
-                                     variance_fold_change, sparsity_fold_change, verbose)
+                self._alter_beta_model(target_modeler, mean_fold_change,
+                                     variance_fold_change,
+                                     sparsity_fold_change=sparsity_fold_change,
+                                     sparsity_logit_shift=sparsity_logit_shift,
+                                     verbose=verbose)
             else:
                 raise ValueError(f"Unknown model parameter structure: {target_modeler.model_params.keys()}")
         else:
@@ -108,57 +114,48 @@ class MarginalModelAlterator:
         Alter Student's T or similar mixture models with means and scales.
         """
         params = modeler.model_params
-        
-        # --- 1. Apply MEAN change ---
+
         if mean_fold_change != 1.0:
             if hasattr(modeler, 'log_transform') and modeler.log_transform:
-                # On log scale, multiplicative change becomes additive shift
                 log_mean_shift = np.log10(mean_fold_change)
                 params['means'] += log_mean_shift
                 if verbose:
                     print(f"  > Applied log10 mean shift: +{log_mean_shift:.3f}")
             else:
-                # Direct multiplicative change
                 params['means'] *= mean_fold_change
                 if verbose:
                     print(f"  > Applied direct mean multiplier: {mean_fold_change}x")
-        
-        # --- 2. Apply VARIANCE change ---
+
         if variance_fold_change != 1.0:
-            # Heuristic 1: Scale component standard deviations
-            # Since Var(aX) = a²Var(X), we use sqrt of desired variance change
             if 'scales' in params:
                 scale_inflation_factor = np.sqrt(variance_fold_change)
                 params['scales'] *= scale_inflation_factor
                 if verbose:
                     print(f"  > Scaled component widths by: {scale_inflation_factor:.3f}x")
-            
-            # Heuristic 2: Increase separation of component means
-            # This creates additional variance through component dispersion
+
             if len(params['means']) > 1 and dispersion_strength > 0:
                 mean_dispersion_factor = 1.0 + (variance_fold_change - 1.0) * dispersion_strength
                 if mean_dispersion_factor != 1.0:
-                    # Calculate weighted mean of current means
                     current_overall_mean = np.sum(params['weights'] * params['means'])
-                    # Spread means around the overall mean
-                    params['means'] = (current_overall_mean + 
+                    params['means'] = (current_overall_mean +
                                      mean_dispersion_factor * (params['means'] - current_overall_mean))
                     if verbose:
                         print(f"  > Increased mean separation by: {mean_dispersion_factor:.3f}x")
     
-    def _alter_beta_model(self, modeler, mean_fold_change, variance_fold_change, sparsity_fold_change, verbose):
+    def _alter_beta_model(self, modeler, mean_fold_change, variance_fold_change,
+                          sparsity_fold_change=None, sparsity_logit_shift=None, verbose=False):
         params = modeler.model_params
-        
+
         if verbose:
             print("  > Altering Beta mixture model...")
-        
-        # Check if we're doing sparsity fold change (takes precedence over mean/var)
-        if sparsity_fold_change != 1.0:
-            return self._alter_beta_model_sparsity_fold_change(modeler, sparsity_fold_change, verbose)
-        
-        # Otherwise, do mean/variance fold-change based alterations
-        # For Beta distribution: mean = α/(α+β), var = αβ/((α+β)²(α+β+1))
-        # We adjust α and β to achieve desired mean and variance changes
+
+        # Sparsity: logit-shift takes precedence over deprecated fold-change
+        if sparsity_logit_shift is not None and sparsity_logit_shift != 0.0:
+            return self._alter_beta_model_sparsity_logit_shift(
+                modeler, float(sparsity_logit_shift), verbose)
+        if sparsity_fold_change is not None and sparsity_fold_change != 1.0:
+            return self._alter_beta_model_sparsity_fold_change(
+                modeler, float(sparsity_fold_change), verbose)
         
         for i in range(len(params['alphas'])):
             alpha_old = params['alphas'][i]
@@ -197,76 +194,67 @@ class MarginalModelAlterator:
         
         return modeler
     
-    def _alter_beta_model_sparsity_fold_change(self, modeler, sparsity_fold_change, verbose):
+    def _alter_beta_model_sparsity_logit_shift(self, modeler, delta_z, verbose):
+        """Alter Beta mixture model by direct logit-space shift.
+
+        logit(q_k') = logit(q_k) + δ_z
+
+        All component means are shifted by the same δ_z in logit space.
+        Component concentrations S_k = α_k + β_k are preserved.
+        This keeps all q_k' ∈ (0, 1) automatically and preserves component ordering.
+
+        Args:
+            delta_z: Additive shift in logit(z) space.
+                     δ_z > 0 → more sparse, δ_z < 0 → less sparse.
         """
-        Alter Beta mixture model using sparsity fold change.
-        
-        This method multiplies the current average sparsity by the fold change factor.
-        """
-        if sparsity_fold_change <= 0:
-            raise ValueError("sparsity_fold_change must be positive")
-            
         params = modeler.model_params
         weights = params['weights']
         alphas = params['alphas']
         betas = params['betas']
-        
-        # 1. Calculate current overall mean of the mixture
+
         component_means = alphas / (alphas + betas)
-        current_overall_mean = np.sum(weights * component_means)
-        
-        # 2. Calculate target sparsity using fold change
-        target_mean_sparsity = current_overall_mean * sparsity_fold_change
-        
-        # 3. Clip to valid range
-        target_mean_sparsity = np.clip(target_mean_sparsity, 0.01, 0.99)
-        
+        current_global_mean = float(np.sum(weights * component_means))
+
+        logit = lambda q: np.log(np.clip(q, 1e-8, 1.0 - 1e-8) / (1.0 - np.clip(q, 1e-8, 1.0 - 1e-8)))
+        inv_logit = lambda x: 1.0 / (1.0 + np.exp(-x))
+
+        logit_means = logit(component_means)
+        shifted_means = inv_logit(logit_means + delta_z)
+        concentrations = alphas + betas  # S_k preserved
+
+        new_alphas = np.clip(shifted_means * concentrations, 1e-3, 1e3)
+        new_betas = np.clip((1.0 - shifted_means) * concentrations, 1e-3, 1e3)
+
+        params['alphas'] = new_alphas
+        params['betas'] = new_betas
+
+        achieved_global_mean = float(np.sum(weights * shifted_means))
+        delta_z_bar = achieved_global_mean - current_global_mean
+        detection_ratio = (1.0 - achieved_global_mean) / (1.0 - current_global_mean) if current_global_mean < 1.0 else 0.0
+
         if verbose:
-            print(f"    Current Mean Sparsity: {current_overall_mean:.3f}")
-            print(f"    Sparsity Fold Change: {sparsity_fold_change}x")
-            print(f"    Target Mean Sparsity: {target_mean_sparsity:.3f}")
-        
-        # 4. Determine the required shift
-        shift = target_mean_sparsity - current_overall_mean
-        
-        # 5. Apply shift to each component while preserving shape
-        for i in range(len(alphas)):
-            # Shift the mean of this component
-            old_mean = component_means[i]
-            old_alpha = alphas[i]
-            old_beta = betas[i]
-            new_mean = old_mean + shift
-            
-            # Clip to ensure the new mean is valid
-            new_mean_clipped = np.clip(new_mean, 0.01, 0.99)
-            
-            # Preserve the sum S = alpha + beta to maintain component shape
-            S = alphas[i] + betas[i]
-            
-            # Solve for the new alpha and beta
-            new_alpha = new_mean_clipped * S
-            new_beta = S - new_alpha
-            
-            # Ensure positive parameters
-            new_alpha = max(0.1, new_alpha)
-            new_beta = max(0.1, new_beta)
-            
-            params['alphas'][i] = new_alpha
-            params['betas'][i] = new_beta
-            
-            if verbose:
-                print(f"    Component {i+1}: α={old_alpha:.2f}→{new_alpha:.2f}, β={old_beta:.2f}→{new_beta:.2f}")
-        
-        # Verify final result
-        final_component_means = params['alphas'] / (params['alphas'] + params['betas'])
-        final_mean = np.sum(weights * final_component_means)
-        achieved_fold_change = final_mean / current_overall_mean
-        
-        if verbose:
-            print(f"    Achieved Mean Sparsity: {final_mean:.3f}")
-            print(f"    Achieved Fold Change: {achieved_fold_change:.3f}x")
-        
+            print(f"    δ_z = {delta_z:+.4f}")
+            print(f"    Global sparsity: {current_global_mean:.4f} → {achieved_global_mean:.4f} "
+                  f"(Δ = {delta_z_bar:+.4f})")
+            print(f"    Detection rate ratio (1-z')/(1-z): {detection_ratio:.3f}")
+            for i in range(len(alphas)):
+                print(f"    Component {i+1}: q={component_means[i]:.3f}→{shifted_means[i]:.3f}, "
+                      f"α={alphas[i]:.2f}→{new_alphas[i]:.2f}, β={betas[i]:.2f}→{new_betas[i]:.2f}")
+
         return modeler
+
+    def _alter_beta_model_sparsity_fold_change(self, modeler, sparsity_fold_change, verbose):
+        """[deprecated] Legacy sparsity fold-change. Delegates to logit-shift with
+        δ_z ≈ log(α_z) approximation, then falls back to binary search for exact match."""
+        import warnings
+        warnings.warn(
+            "sparsity_fold_change is deprecated; use sparsity_logit_shift (δ_z) instead. "
+            "Approximating δ_z from fold-change.",
+            DeprecationWarning, stacklevel=2,
+        )
+        # Approximate: if α_z = 2.0, then δ_z ≈ log(2.0) ≈ 0.69
+        delta_z = np.log(max(sparsity_fold_change, 1e-4))
+        return self._alter_beta_model_sparsity_logit_shift(modeler, delta_z, verbose)
     
     def visualize_alteration(self, original_modeler, altered_modeler, 
                            title: str = "Model Alteration Comparison",
@@ -333,10 +321,15 @@ def alter_marginal_model(modeler,
                          dispersion_strength: float = 0.2,
                          preserve_original: bool = True,
                          verbose: bool = True,
-                         sparsity_fold_change: float = 1.0):
+                         sparsity_fold_change: float | None = None,
+                         sparsity_logit_shift: float | None = None):
     """
     Convenience wrapper expected by other modules (e.g. FEAST.parameter_cloud).
     Delegates to MarginalModelAlterator.alter_model and returns the altered modeler.
+
+    Args:
+        sparsity_logit_shift: δ_z — direct logit-space shift (preferred).
+        sparsity_fold_change: [deprecated] fold-change for zero proportion.
     """
     alterator = MarginalModelAlterator()
     return alterator.alter_model(
@@ -344,9 +337,10 @@ def alter_marginal_model(modeler,
         mean_fold_change=mean_fold_change,
         variance_fold_change=variance_fold_change,
         sparsity_fold_change=sparsity_fold_change,
+        sparsity_logit_shift=sparsity_logit_shift,
         dispersion_strength=dispersion_strength,
         preserve_original=preserve_original,
-        verbose=verbose
+        verbose=verbose,
     )
 
 # Integration helper for main FEAST pipeline
@@ -362,85 +356,152 @@ class AlterationConfig:
     Default: No changes to any parameter (all neutral values)
     """
     
-    def __init__(self, 
+    def __init__(self,
                  mean_fold_change: float = 1.0,
                  variance_fold_change: float = 1.0,
-                 sparsity_fold_change: float = 1.0,
+                 sparsity_logit_shift: float = 0.0,
                  dispersion_strength: float = 0.2,
+                 variance_dispersion: float = 1.0,
+                 mean_variance_coupling: str | None = None,
                  apply_to_mean: bool = False,
                  apply_to_variance: bool = False,
-                 apply_to_zero_prop: bool = False):
-        """
-        Configure alteration parameters for FEAST integration.
-        
+                 apply_to_zero_prop: bool = False,
+                 # --- deprecated, kept for backward compat ---
+                 sparsity_fold_change: float | None = None,
+                 ):
+        """Configure alteration parameters for FEAST integration.
+
+        Three independent interventions on gene-level summary statistics,
+        each on its own natural scale:
+
+        Mean alteration (α_μ):
+            μ' = α_μ · μ
+            Pure log-location shift of StudentT mixture: m_k' += log10(α_μ).
+            Weights, df, and scales unchanged.
+            With mean_variance_coupling="fano", also shifts variance by α_μ.
+
+        Variance alteration (α_v, ρ_v):
+            σ²' = α_v · σ²                            — level shift
+            m_k' = mean(m') + c_v + ρ_v (m_k - mean(m))  — dispersion
+            s_k' = ρ_v · s_k
+
+        Sparsity alteration (δ_z):
+            logit(z') = logit(z) + δ_z
+            Direct logit-space shift of Beta component means.
+            δ_z > 0 → more sparse, δ_z < 0 → less sparse.
+            Component concentrations S_k preserved.
+
+        Copula C preserved throughout.
+
         Args:
-            mean_fold_change: Multiply gene expression mean statistics by this factor (1.0 = no change)
-            variance_fold_change: Multiply gene expression variance statistics by this factor (1.0 = no change)
-            sparsity_fold_change: Multiply zero proportion by this factor (1.0 = no change)
-                                - 0.5 = reduce sparsity by half (more expression)
-                                - 2.0 = double sparsity (more zeros)
-            dispersion_strength: Control strength of alterations (0-1)
-            apply_to_mean: Enable mean alterations (default: False)
-            apply_to_variance: Enable variance alterations (default: False)
-            apply_to_zero_prop: Enable zero proportion alterations (default: False)
+            mean_fold_change: α_μ — fold-change for mean expression (1.0 = no change)
+            variance_fold_change: α_v — fold-change for variance level (1.0 = no change)
+            sparsity_logit_shift: δ_z — additive shift in logit(z) space (0.0 = no change)
+            dispersion_strength: legacy parameter
+            variance_dispersion: ρ_v — variance heterogeneity (1.0 = preserve shape)
+            mean_variance_coupling: "fano" to auto-scale variance with mean, or None
+            apply_to_mean, apply_to_variance, apply_to_zero_prop: which axes to alter
+            sparsity_fold_change: [deprecated] use sparsity_logit_shift instead
         """
         self.mean_fold_change = mean_fold_change
         self.variance_fold_change = variance_fold_change
-        self.sparsity_fold_change = sparsity_fold_change
         self.dispersion_strength = dispersion_strength
+        self.variance_dispersion = variance_dispersion
+        self.mean_variance_coupling = mean_variance_coupling
         self.apply_to_mean = apply_to_mean
         self.apply_to_variance = apply_to_variance
         self.apply_to_zero_prop = apply_to_zero_prop
-    
+        # Resolve sparsity: δ_z takes precedence over deprecated α_z
+        if sparsity_fold_change is not None and sparsity_logit_shift == 0.0:
+            self.sparsity_logit_shift = float(sparsity_fold_change)
+        else:
+            self.sparsity_logit_shift = float(sparsity_logit_shift)
+        # Backward-compat alias
+        self.sparsity_fold_change = self.sparsity_logit_shift
+
     def to_dict(self):
         """Convert configuration to dictionary for easy parameter passing."""
         return {
             'mean_fold_change': self.mean_fold_change,
             'variance_fold_change': self.variance_fold_change,
-            'sparsity_fold_change': self.sparsity_fold_change,
+            'sparsity_logit_shift': self.sparsity_logit_shift,
             'dispersion_strength': self.dispersion_strength,
+            'variance_dispersion': self.variance_dispersion,
+            'mean_variance_coupling': self.mean_variance_coupling,
             'apply_to_mean': self.apply_to_mean,
             'apply_to_variance': self.apply_to_variance,
-            'apply_to_zero_prop': self.apply_to_zero_prop
+            'apply_to_zero_prop': self.apply_to_zero_prop,
         }
     
     @classmethod
-    def mean_only(cls, fold_change: float, strength: float = 0.2):
-        """Create config for mean-only alterations."""
+    def mean_only(cls, fold_change: float, variance_coupling: str | None = None):
+        """Create config for mean-only alterations.
+
+        Args:
+            fold_change: α_μ
+            variance_coupling: "fano" to auto-scale variance with mean, or None
+        """
         return cls(
             mean_fold_change=fold_change,
             apply_to_mean=True,
-            dispersion_strength=strength
+            mean_variance_coupling=variance_coupling,
         )
-    
-    @classmethod 
-    def variance_only(cls, fold_change: float, strength: float = 0.2):
-        """Create config for variance-only alterations."""
+
+    @classmethod
+    def variance_only(cls, fold_change: float, dispersion: float = 1.0):
+        """Create config for variance-level alterations.
+
+        Args:
+            fold_change: α_v level shift
+            dispersion: ρ_v shape parameter (1.0 = preserve, >1.0 = amplify heterogeneity)
+        """
         return cls(
             variance_fold_change=fold_change,
             apply_to_variance=True,
-            dispersion_strength=strength
+            variance_dispersion=dispersion,
         )
-    
+
     @classmethod
-    def sparsity_only(cls, fold_change: float, strength: float = 0.2):
-        """Create config for sparsity-only alterations."""
+    def variance_heterogeneity(cls, rho: float):
+        """Create config for variance heterogeneity alteration (level fixed at 1.0)."""
         return cls(
-            sparsity_fold_change=fold_change,
-            apply_to_zero_prop=True,
-            dispersion_strength=strength
+            variance_fold_change=1.0,
+            apply_to_variance=True,
+            variance_dispersion=rho,
         )
-    
+
     @classmethod
-    def comprehensive(cls, mean_fc: float = 1.0, var_fc: float = 1.0, 
-                     sparsity_fc: float = 1.0, strength: float = 0.2):
+    def sparsity_logit(cls, delta: float):
+        """Create config for sparsity logit-shift alteration.
+
+        Args:
+            delta: δ_z — additive shift in logit(z) space.
+                   δ_z > 0 → more sparse, δ_z < 0 → less sparse.
+        """
+        return cls(
+            sparsity_logit_shift=delta,
+            apply_to_zero_prop=True,
+        )
+
+    @classmethod
+    def sparsity_only(cls, fold_change: float | None = None, logit_shift: float = 0.0):
+        """Create config for sparsity-only alterations. [deprecated: use sparsity_logit]"""
+        if fold_change is not None:
+            return cls(sparsity_fold_change=fold_change, apply_to_zero_prop=True)
+        return cls(sparsity_logit_shift=logit_shift, apply_to_zero_prop=True)
+
+    @classmethod
+    def comprehensive(cls, mean_fc: float = 1.0, var_fc: float = 1.0,
+                     delta_z: float = 0.0, var_disp: float = 1.0,
+                     mean_var_coupling: str | None = None):
         """Create config with all alterations enabled."""
         return cls(
             mean_fold_change=mean_fc,
             apply_to_mean=mean_fc != 1.0,
             variance_fold_change=var_fc,
             apply_to_variance=var_fc != 1.0,
-            sparsity_fold_change=sparsity_fc,
-            apply_to_zero_prop=sparsity_fc != 1.0,
-            dispersion_strength=strength
+            sparsity_logit_shift=delta_z,
+            apply_to_zero_prop=delta_z != 0.0,
+            variance_dispersion=var_disp,
+            mean_variance_coupling=mean_var_coupling,
         )

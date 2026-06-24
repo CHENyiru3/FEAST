@@ -3,17 +3,10 @@ import pandas as pd
 import warnings
 from typing import Optional
 
-# --- Imports for parallelization and distribution distance ---
 from joblib import Parallel, delayed
 from scipy.stats import wasserstein_distance
 
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-import seaborn as sns
-
-import scanpy as sc
-
-from scipy.stats import rankdata, t
+from scipy.stats import rankdata
 from scipy.optimize import linear_sum_assignment, minimize
 from scipy.spatial.distance import cdist
 from sklearn.preprocessing import StandardScaler
@@ -64,7 +57,12 @@ def alteration_config_to_dict(alteration_config=None) -> Optional[dict]:
 
 
 def apply_alteration_to_stats(stats_df: pd.DataFrame, alteration_config=None) -> pd.DataFrame:
-    """Apply deterministic fold-change transforms to gene summary statistics."""
+    """Apply scalar transforms to gene summary statistics (legacy/ablation path).
+
+    For sparsity, applies the same logit-shift as the distributional path,
+    but post-hoc on sampled values rather than baked into Beta model parameters.
+    The ablation difference is in WHEN the shift is applied, not in the shift itself.
+    """
     config = normalize_alteration_config(alteration_config)
     target = stats_df.copy()
     if config is None:
@@ -75,7 +73,10 @@ def apply_alteration_to_stats(stats_df: pd.DataFrame, alteration_config=None) ->
     if config.apply_to_variance:
         target['variance'] = target['variance'] * float(config.variance_fold_change)
     if config.apply_to_zero_prop:
-        target['zero_prop'] = target['zero_prop'] * float(config.sparsity_fold_change)
+        delta_z = float(config.sparsity_logit_shift)
+        if delta_z != 0.0:
+            z = target['zero_prop'].clip(1e-8, 1.0 - 1e-8)
+            target['zero_prop'] = 1.0 / (1.0 + np.exp(-(np.log(z / (1.0 - z)) + delta_z)))
     return target
 
 
@@ -93,6 +94,31 @@ def project_stats_to_feasible_domain(stats_df: pd.DataFrame) -> tuple[pd.DataFra
         'infeasible_gene_count': int(changed.sum()),
         'zero_prop_clipped_gene_count': int(zero_clipped.sum()),
         'projection_applied': bool(changed.any()),
+    }
+
+
+def project_to_count_feasible(stats_df: pd.DataFrame,
+                               min_overdispersion: float = 1.1) -> tuple[pd.DataFrame, dict]:
+    """Project (μ, σ², z) triples into the feasible region for NB/ZINB count models.
+
+    Constraint: σ² ≥ μ × min_overdispersion.
+    Without this, the NB dispersion r = μ²/(σ² − μ) becomes negative or infinite,
+    and the downstream count decoder produces numerically unstable results.
+
+    Returns (projected_df, diagnostics).
+    """
+    projected = stats_df[STAT_COLUMNS].copy()
+    n_inflated = 0
+    mask = projected['variance'] < projected['mean'] * min_overdispersion
+    if mask.any():
+        n_inflated = int(mask.sum())
+        projected.loc[mask, 'variance'] = projected.loc[mask, 'mean'] * min_overdispersion
+    projected['mean'] = projected['mean'].clip(lower=1e-10)
+    projected['variance'] = projected['variance'].clip(lower=1e-10)
+    projected['zero_prop'] = projected['zero_prop'].clip(lower=0.0, upper=0.99)
+    return projected, {
+        'variance_inflated_gene_count': n_inflated,
+        'min_overdispersion': float(min_overdispersion),
     }
 
 
@@ -114,6 +140,66 @@ def calculate_fold_change(reference_stats: pd.DataFrame, target_stats: pd.DataFr
 def pseudo_observations(stats_df: pd.DataFrame) -> pd.DataFrame:
     """Return empirical copula pseudo-observations for gene statistics."""
     return stats_df[STAT_COLUMNS].apply(to_uniform)
+
+def apply_batch_deformation(
+    theta: np.ndarray,
+    D: np.ndarray,
+    b: np.ndarray,
+    alpha: float = 1.0,
+) -> np.ndarray:
+    """Apply diagonal affine batch deformation in theta space.
+
+    theta' = [(1 - alpha) * I + alpha * diag(D)] @ theta + alpha * b
+
+    Parameters
+    ----------
+    theta : (G, 3) ndarray  -- reference parameter cloud
+    D : (3,) ndarray        -- diagonal scaling (d_mu, d_omega, d_pi0)
+    b : (3,) ndarray        -- shift vector   (b_mu, b_omega, b_pi0)
+    alpha : float           -- interpolation strength (0=none, 1=full)
+
+    Returns
+    -------
+    theta_deformed : (G, 3) ndarray
+    """
+    theta = np.asarray(theta, dtype=np.float64)
+    D = np.asarray(D, dtype=np.float64).ravel()
+    b = np.asarray(b, dtype=np.float64).ravel()
+    blend = (1.0 - alpha) + alpha * D
+    return theta * blend[None, :] + alpha * b[None, :]
+
+
+class BatchDeformation:
+    """Diagonal affine batch deformation in theta space.
+
+    theta' = [(1-alpha)*I + alpha*diag(D)] @ theta + alpha*b
+
+    Attributes
+    ----------
+    D : (3,) ndarray  -- diagonal scaling (d_mu, d_omega, d_pi0)
+    b : (3,) ndarray  -- shift vector   (b_mu, b_omega, b_pi0)
+    alpha : float     -- interpolation strength (0=none, 1=full)
+    name : str        -- optional label
+    """
+
+    def __init__(self, D, b, alpha=1.0, name=""):
+        self.D = np.asarray(D, dtype=np.float64).ravel()
+        self.b = np.asarray(b, dtype=np.float64).ravel()
+        self.alpha = float(alpha)
+        self.name = str(name)
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "D": self.D.tolist(),
+            "b": self.b.tolist(),
+            "alpha": self.alpha,
+        }
+
+    def __repr__(self):
+        return (f"BatchDeformation(name={self.name!r}, alpha={self.alpha}, "
+                f"D={self.D.tolist()}, b={self.b.tolist()})")
+
 
 class DependencyModeler:
     @staticmethod
@@ -317,8 +403,22 @@ class GeneParameterSimulator:
         assignment_method='hybrid',
         overgeneration_factor=2.0,
         verbose=True,
+        use_distributional_alteration: bool = False,
     ):
-        """Build the gene-indexed target parameter table for an integrated simulation."""
+        """Build the gene-indexed target parameter table for an integrated simulation.
+
+        Two alteration paths for generative mode:
+
+        use_distributional_alteration=True (canonical):
+            θ → θ' (alter_marginal_distributions) → sample from θ' → Π_S → OT assign.
+            Alters the StudentT/Beta mixture parameters.  Copula C preserved.
+
+        use_distributional_alteration=False (legacy / ablation):
+            Sample from θ → apply_alteration_to_stats (scalar multiplication) → Π_S → OT assign.
+            Kept for ablation comparison.
+
+        Empirical mode always uses the legacy scalar-multiplication path (no fitted models).
+        """
         mode = resolve_simulation_mode(simulation_mode)
         config = normalize_alteration_config(alteration_config)
         if self.original_stats is None:
@@ -327,21 +427,32 @@ class GeneParameterSimulator:
         if mode == 'empirical':
             requested = apply_alteration_to_stats(self.original_stats, config)
             projected, feasibility = project_stats_to_feasible_domain(requested)
+            projected, count_feas = project_to_count_feasible(projected)
             table = projected.reset_index().rename(columns={'index': 'gene_id'})
             diagnostics = {
                 'simulation_mode': 'empirical',
                 'gene_parameter_engine': 'empirical',
                 'assignment_method': 'identity',
+                'alteration_path': 'legacy_scalar',
                 'requested_config': alteration_config_to_dict(config),
                 'target_fold_change': alteration_config_to_dict(config),
                 'target_stage_achieved_change': calculate_fold_change(self.original_stats, table),
                 'copula_rank_diagnostics': {'assignment_method': 'identity'},
                 'moment_feasibility': feasibility,
+                'count_feasibility': count_feas,
             }
             return table[['gene_id', 'mean', 'variance', 'zero_prop']], diagnostics
 
         if not self.fitted:
             raise RuntimeError("Generative simulation requires fitted marginal and copula models.")
+
+        if use_distributional_alteration and config is not None:
+            # Canonical path: alter marginal parameters, then sample from altered models
+            self.alter_marginal_distributions(config, verbose=verbose)
+            alteration_path = 'distributional'
+        else:
+            alteration_path = 'legacy_scalar'
+
         sampled_params, sampled_u = self.simulate(
             n_genes=len(self.original_stats),
             overgeneration_factor=overgeneration_factor,
@@ -349,8 +460,17 @@ class GeneParameterSimulator:
             random_seed=random_seed,
             return_uniform=True,
         )
-        requested = apply_alteration_to_stats(sampled_params, config)
-        projected, feasibility = project_stats_to_feasible_domain(requested)
+
+        if alteration_path == 'legacy_scalar':
+            # Legacy: post-sampling scalar multiplication
+            requested = apply_alteration_to_stats(sampled_params, config)
+            projected, feasibility = project_stats_to_feasible_domain(requested)
+        else:
+            # Distributional: alteration baked into models — sampled values already altered
+            projected, feasibility = project_stats_to_feasible_domain(sampled_params)
+
+        projected, count_feas = project_to_count_feasible(projected)
+
         if assignment_method == 'copula_rank':
             assigned, assignment_diag = self.assign_to_genes_copula_rank(
                 projected,
@@ -374,11 +494,13 @@ class GeneParameterSimulator:
             'simulation_mode': 'generative',
             'gene_parameter_engine': 'generative',
             'assignment_method': assignment_method,
+            'alteration_path': alteration_path,
             'requested_config': alteration_config_to_dict(config),
             'target_fold_change': alteration_config_to_dict(config),
             'target_stage_achieved_change': calculate_fold_change(self.original_stats, assigned),
             'copula_rank_diagnostics': assignment_diag,
             'moment_feasibility': feasibility,
+            'count_feasibility': count_feas,
         }
         return assigned[['gene_id', 'mean', 'variance', 'zero_prop']], diagnostics
 
@@ -447,116 +569,146 @@ class GeneParameterSimulator:
         return best_assigned_params
 
     def alter_marginal_distributions(self, alteration_config=None, verbose=True):
-        """
-        Alter fitted marginal distributions using user-friendly fold-change controls.
-        
-        Args:
-            alteration_config (AlterationConfig or dict): Configuration for alterations.
-                                                         If None, no alterations are applied.
-            verbose (bool): Print alteration details
-            
-        Returns:
-            self: Returns the modified simulator instance
-            
-        Example:
-            >>> # Create alteration configuration
-            >>> config = AlterationConfig(
-            ...     mean_fold_change=2.0,      # Double gene expression means
-            ...     variance_fold_change=1.5,  # Increase variance by 50%
-            ...     apply_to_mean=True,
-            ...     apply_to_variance=True,
-            ...     apply_to_zero_prop=False
-            ... )
-            >>> simulator.alter_marginal_distributions(config)
+        """Alter fitted marginal distributions at the parameter level.
+
+        Keeps the copula C fixed and applies distribution-level interventions
+        to the marginals:
+          θ → θ' → sample from altered marginals with original copula.
+
+        Mean (α_μ):
+            m_k' = m_k + log10(α_μ)
+            With mean_variance_coupling="fano": also shifts variance by α_μ.
+
+        Variance (α_v, ρ_v):
+            m_k' = mean(m') + c_v + ρ_v (m_k - mean(m))
+            s_k' = ρ_v · s_k
+
+        Sparsity (δ_z):
+            logit(q_k') = logit(q_k) + δ_z
+            Component concentrations S_k preserved.
         """
         if not self.fitted:
             raise RuntimeError("Simulator must be fitted before marginal distributions can be altered.")
-        
+
         if alteration_config is None:
             if verbose:
                 print("No alteration configuration provided. Skipping marginal distribution alterations.")
             return self
-        
-        # Convert to AlterationConfig if dictionary provided
+
         if isinstance(alteration_config, dict):
             alteration_config = AlterationConfig(**alteration_config)
-        
+
+        rho_v = getattr(alteration_config, 'variance_dispersion', 1.0)
+        coupling = getattr(alteration_config, 'mean_variance_coupling', None)
+        delta_z = getattr(alteration_config, 'sparsity_logit_shift', 0.0)
+
         if verbose:
-            print(f"\n--- [ALTERING MARGINALS] Applying distribution modifications ---")
-            print(f"  Mean level fold change: {alteration_config.mean_fold_change}x")
-            print(f"  Variance level fold change: {alteration_config.variance_fold_change}x")
-            print(f"  Zero proportion fold change: {alteration_config.sparsity_fold_change}x")
-            print(f"  Apply to mean: {alteration_config.apply_to_mean}")
-            print(f"  Apply to variance: {alteration_config.apply_to_variance}")
-            print(f"  Apply to zero_prop: {alteration_config.apply_to_zero_prop}")
-        
+            print(f"\n--- [ALTERING MARGINALS] Distribution-level intervention ---")
+            print(f"  Mean α_μ = {alteration_config.mean_fold_change}x  "
+                  f"(coupling: {coupling or 'none'})")
+            print(f"  Variance α_v = {alteration_config.variance_fold_change}x  ρ_v = {rho_v}")
+            print(f"  Sparsity δ_z = {delta_z:+.4f}")
+            print(f"  Copula: preserved (rank-dependence structure unchanged)")
+
         if self.target_stats is None:
             self.target_stats = self.original_stats.copy()
 
-        # Apply alterations to selected marginal distributions
         alterations_applied = []
-        
+
+        # --- Mean alteration ---
         if alteration_config.apply_to_mean:
+            alpha_mu = alteration_config.mean_fold_change
             if verbose:
-                print("\n  > Altering MEAN distribution...")
+                print(f"\n  > Altering MEAN marginal (StudentT mixture) — "
+                      f"shift by log10({alpha_mu}) = {np.log10(alpha_mu):+.4f}")
             self.target_stats['mean'] = np.clip(
-                self.target_stats['mean'] * alteration_config.mean_fold_change,
-                1e-10,
-                None,
-            )
+                self.target_stats['mean'] * alpha_mu, 1e-10, None)
             self.param_models['mean'] = alter_marginal_model(
                 self.param_models['mean'],
-                mean_fold_change=alteration_config.mean_fold_change,
+                mean_fold_change=alpha_mu,
                 variance_fold_change=1.0,
-                dispersion_strength=alteration_config.dispersion_strength,
-                preserve_original=False,  # Modify in place
-                verbose=verbose
+                dispersion_strength=0.0,
+                preserve_original=False,
+                verbose=verbose,
             )
             alterations_applied.append('mean')
-        
+
+            # Fano coupling: scale variance by same α_μ to prevent infeasible triples
+            if coupling == "fano":
+                if verbose:
+                    print(f"  > [Fano coupling] Also shifting VARIANCE marginal by α_μ={alpha_mu}x")
+                self.target_stats['variance'] = np.clip(
+                    self.target_stats['variance'] * alpha_mu, 1e-10, None)
+                self.param_models['variance'] = alter_marginal_model(
+                    self.param_models['variance'],
+                    mean_fold_change=alpha_mu,
+                    variance_fold_change=rho_v,
+                    dispersion_strength=alteration_config.dispersion_strength,
+                    preserve_original=False,
+                    verbose=False,
+                )
+                if 'variance' not in alterations_applied:
+                    alterations_applied.append('variance (fano-coupled)')
+
+        # --- Variance alteration ---
         if alteration_config.apply_to_variance:
+            alpha_v = alteration_config.variance_fold_change
             if verbose:
-                print("\n  > Altering VARIANCE distribution...")
+                print(f"\n  > Altering VARIANCE marginal (StudentT mixture) — "
+                      f"shift by log10({alpha_v}) = {np.log10(alpha_v):+.4f}, ρ_v={rho_v}")
             self.target_stats['variance'] = np.clip(
-                self.target_stats['variance'] * alteration_config.variance_fold_change,
-                1e-10,
-                None,
-            )
+                self.target_stats['variance'] * alpha_v, 1e-10, None)
             self.param_models['variance'] = alter_marginal_model(
                 self.param_models['variance'],
-                mean_fold_change=alteration_config.variance_fold_change,
-                variance_fold_change=1.0,
+                mean_fold_change=alpha_v,
+                variance_fold_change=rho_v,
                 dispersion_strength=alteration_config.dispersion_strength,
-                preserve_original=False,  # Modify in place
-                verbose=verbose
+                preserve_original=False,
+                verbose=verbose,
             )
-            alterations_applied.append('variance')
-        
+            if 'variance' not in alterations_applied:
+                alterations_applied.append('variance')
+
+        # --- Sparsity alteration ---
         if alteration_config.apply_to_zero_prop:
             if verbose:
-                print("\n  > Altering ZERO PROPORTION distribution...")
-            self.target_stats['zero_prop'] = np.clip(
-                self.target_stats['zero_prop'] * alteration_config.sparsity_fold_change,
-                1e-10,
-                0.99,
-            )
+                print(f"\n  > Altering SPARSITY marginal (Beta mixture) — "
+                      f"logit shift δ_z = {delta_z:+.4f}")
+            # Save current global sparsity for target_stats scaling
+            old_zp_params = self.param_models['zero_prop'].model_params
+            old_component_means = old_zp_params['alphas'] / (
+                old_zp_params['alphas'] + old_zp_params['betas'])
+            old_global_zp = float(np.sum(
+                old_zp_params['weights'] * old_component_means))
+
             self.param_models['zero_prop'] = alter_marginal_model(
                 self.param_models['zero_prop'],
                 mean_fold_change=1.0,
                 variance_fold_change=1.0,
-                sparsity_fold_change=alteration_config.sparsity_fold_change,
-                dispersion_strength=alteration_config.dispersion_strength,
-                preserve_original=False,  # Modify in place
-                verbose=verbose
+                sparsity_logit_shift=delta_z,
+                preserve_original=False,
+                verbose=verbose,
             )
+            # Scale target_stats to reflect achieved sparsity shift
+            new_zp_params = self.param_models['zero_prop'].model_params
+            new_component_means = new_zp_params['alphas'] / (
+                new_zp_params['alphas'] + new_zp_params['betas'])
+            new_global_zp = float(np.sum(
+                new_zp_params['weights'] * new_component_means))
+            if old_global_zp > 1e-10:
+                zp_scale = new_global_zp / old_global_zp
+                self.target_stats['zero_prop'] = np.clip(
+                    self.target_stats['zero_prop'] * zp_scale, 1e-10, 0.99)
+            if verbose:
+                print(f"    Global sparsity: {old_global_zp:.4f} → {new_global_zp:.4f} "
+                      f"(scale: {zp_scale:.4f})")
             alterations_applied.append('zero_prop')
-        
+
         if verbose:
             print(f"\n✓ Marginal distribution alterations complete.")
             print(f"  Altered distributions: {', '.join(alterations_applied)}")
-            print(f"  Note: Dependency structure (copula) remains unchanged.")
-            print(f"        Re-simulation will use altered marginals with original dependencies.")
-        
+            print(f"  Copula C preserved — same rank-dependence, shifted marginals.")
+
         return self
 
 def _calculate_zip_theoretical_stats(params):
@@ -578,12 +730,6 @@ def _calculate_zinb_theoretical_stats(params):
     return np.array([mean, variance, zero_prop])
 
 
-# =============================================================================
-# --- NEW: LOG-SCALE OBJECTIVE FUNCTION ---
-# This is the core of the improvement. It minimizes the squared error
-# between the log-transformed theoretical and target statistics.
-# =============================================================================
-
 def _moment_objective_function_log_scale(params, target_stats, model_type):
     """
     Calculates the sum of squared errors on the log10 scale.
@@ -601,19 +747,10 @@ def _moment_objective_function_log_scale(params, target_stats, model_type):
         if not (0 < params[0] < 1 and params[1] > 0 and params[2] > 0): return np.inf
         theoretical_stats = _calculate_zinb_theoretical_stats(params)
 
-    # Use log10 transform to evaluate error in terms of magnitude.
-    # Add a small epsilon (1e-10) for numerical stability if a stat is zero.
     log_theoretical = np.log10(theoretical_stats + 1e-10)
     log_target = np.log10(target_stats + 1e-10)
-    
-    # Return the sum of squared errors in log space
     return np.sum((log_theoretical - log_target)**2)
 
-
-# =============================================================================
-# --- UPDATED: PARAMETER ESTIMATION ROUTINES ---
-# These functions now call the new log-scale objective function.
-# =============================================================================
 
 def _estimate_zip_by_moment_optimization(mu_total, var_total, zero_prop,
                                           n_spots=None, boundary=None):
@@ -650,6 +787,7 @@ def _finite_sample_correct_zip(pi0, lam, target_stats, n_spots, boundary=None):
     """Adjust ZIP params so realized finite-sample moments match targets."""
     target_mean, target_var, target_zero = target_stats
     for _ in range(10):
+        lam = float(np.clip(lam, 1e-8, 1e9))
         zero_mask = np.random.random(n_spots) < pi0
         counts = np.random.poisson(lam, size=n_spots)
         counts[zero_mask] = 0
@@ -667,11 +805,6 @@ def _finite_sample_correct_zip(pi0, lam, target_stats, n_spots, boundary=None):
             pi0 = min(pi0 + 0.10 * (target_zero - real_zero), 0.99)
         elif real_zero > target_zero:
             pi0 = max(pi0 - 0.10 * (real_zero - target_zero), 0.0)
-    # Guarantee exact mean match after finite-sample correction.
-    # The iterative loop above adjusts pi0 for zero proportion; this
-    # forces lambda so (1-pi0)*lambda == target_mean by construction.
-    if target_mean > 1e-10:
-        lam = target_mean / max(1.0 - pi0, 1e-8)
     return pi0, lam
 
 def _estimate_zinb_by_moment_optimization(mu_total, var_total, zero_prop,
@@ -735,9 +868,6 @@ def _finite_sample_correct_zinb(pi0, mu, r, target_stats, n_spots, boundary=None
             pi0 = min(pi0 + 0.10 * (target_zero - real_zero), 0.99)
         elif real_zero > target_zero:
             pi0 = max(pi0 - 0.10 * (real_zero - target_zero), 0.0)
-    # Guarantee exact mean match after finite-sample correction.
-    if target_mean > 1e-10:
-        mu = target_mean / max(1.0 - pi0, 1e-8)
     return pi0, mu, r
 
 def _select_model_with_heuristic(mu_total, var_total, zero_prop,

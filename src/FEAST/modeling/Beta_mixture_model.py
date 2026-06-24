@@ -1,14 +1,9 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy import stats
 from scipy.stats import beta
 from scipy.optimize import minimize
 from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-import warnings
-
-warnings.filterwarnings('ignore')
 
 def calculate_aic_beta(log_likelihood, n_params):
     """Calculate AIC score for model selection."""

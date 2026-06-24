@@ -1,7 +1,5 @@
-import scanpy as sc
 import anndata as ad
 import numpy as np
-import pandas as pd
 from typing import Optional, Dict, Any, Tuple, Union
 
 # Import core simulation functions from the main simulator
@@ -40,16 +38,9 @@ def _sanitize_params_for_hdf5(params: Optional[Dict[str, Any]]) -> Optional[Dict
         try:
             from ..modeling.marginal_alteration import AlterationConfig
             if isinstance(sanitized['alteration_config'], AlterationConfig):
-                print(f"[DEBUG] Converting AlterationConfig to dict: {type(sanitized['alteration_config'])} -> dict")
                 sanitized['alteration_config'] = sanitized['alteration_config'].to_dict()
-                print(f"[DEBUG] Conversion successful. New type: {type(sanitized['alteration_config'])}")
         except ImportError:
-            # If we can't import AlterationConfig, leave it as is
             pass
-        except Exception as e:
-            print(f"[DEBUG] Error during conversion: {e}")
-            import traceback
-            traceback.print_exc()
     
     return sanitized
 
@@ -75,7 +66,6 @@ class AlignmentSimulator:
         self.reference_adata.var_names_make_unique()
         self.reference_adata.obs_names_make_unique()
         
-        # Initialize the core spatial simulator
         self.core_simulator = SpatialSimulator(self.reference_adata, model_params)
         self._fitted = False
     
@@ -122,7 +112,6 @@ class AlignmentSimulator:
         if not self._fitted:
             raise ValueError("Model not fitted. Call fit_model() first.")
         
-        # Set default expression parameters
         if expression_params is None:
             expression_params = {
                 'verbose': True,
@@ -131,11 +120,9 @@ class AlignmentSimulator:
         
         print(f"Generating alignment dataset with {rotation_angle}° rotation ({data_type} method)")
         
-        # Step 1: Simulate expression for original data
         print("Simulating expression for original dataset...")
         original_simulated = self.core_simulator.simulate(**expression_params)
         
-        # Step 2: Apply spatial rotation transformation
         print(f"Applying {data_type} rotation transformation...")
         rotation_transformer = RotationTransformer(original_simulated)
         
@@ -155,7 +142,6 @@ class AlignmentSimulator:
         else:
             raise ValueError("data_type must be 'imaging' or 'sequencing'")
         
-        # Step 3: Add metadata about the simulation
         original_simulated.uns['alignment_simulation'] = {
             'type': 'original',
             'rotation_angle': 0,
@@ -204,7 +190,6 @@ class AlignmentSimulator:
         if not self._fitted:
             raise ValueError("Model not fitted. Call fit_model() first.")
         
-        # Set default expression parameters
         if expression_params is None:
             expression_params = {
                 'verbose': True,
@@ -213,11 +198,9 @@ class AlignmentSimulator:
         
         print(f"Generating alignment dataset with TPS warping (distort_level={distort_level})")
         
-        # Step 1: Simulate expression for original data
         print("Simulating expression for original dataset...")
         original_simulated = self.core_simulator.simulate(**expression_params)
         
-        # Step 2: Apply TPS warping transformation
         print("Applying TPS warping transformation...")
         warp_transformer = WarpTransformer(
             original_simulated,
@@ -227,7 +210,6 @@ class AlignmentSimulator:
         )
         warped_transformed = warp_transformer.transform(apply_rotation=apply_rotation)
         
-        # Step 3: Add metadata
         original_simulated.uns['alignment_simulation'] = {
             'type': 'original',
             'transformation': 'none',
@@ -274,7 +256,6 @@ class AlignmentSimulator:
         if not self._fitted:
             raise ValueError("Model not fitted. Call fit_model() first.")
         
-        # Set default expression parameters
         if expression_params is None:
             expression_params = {
                 'verbose': True,
@@ -285,23 +266,18 @@ class AlignmentSimulator:
         print(f"  Cut bounds: {cut_bounds}")
         print(f"  Move offset: {move_offset}")
         
-        # Step 1: Simulate expression for original data
         print("Simulating expression for original dataset...")
         original_simulated = self.core_simulator.simulate(**expression_params)
         
-        # Step 2: Apply cut-and-move transformation
         print("Applying cut-and-move transformation...")
         spatial_transformer = SpatialTransformer(original_simulated)
         
-        # Cut the region
         x_min, x_max, y_min, y_max = cut_bounds
         cut_region = spatial_transformer.cut(x_min, x_max, y_min, y_max)
         
-        # Move the cut region
         dx, dy = move_offset
         cut_moved = spatial_transformer.move(dx, dy)
         
-        # Step 3: Add metadata
         original_simulated.uns['alignment_simulation'] = {
             'type': 'original',
             'transformation': 'none',
@@ -458,11 +434,9 @@ def simulate_alignment_rotation(
     if 'verbose' not in simulation_params:
         simulation_params['verbose'] = True
     
-    # Step 1: Generate original simulated data using single slice simulator
     print("Generating original dataset using simulate_single_slice...")
     original_simulated = simulate_single_slice(adata, **simulation_params)
     
-    # Step 2: Apply spatial rotation transformation
     print(f"Applying {data_type} rotation transformation...")
     rotation_transformer = RotationTransformer(original_simulated)
     
@@ -490,7 +464,6 @@ def simulate_alignment_rotation(
         if removed_n > 0:
             print(f"Filtered {removed_n} edge spots (margin_ratio={edge_margin_ratio:.3f}) from rotated slice")
 
-    # Step 3: Add metadata
     # Convert AlterationConfig to dict if present (needed for HDF5 serialization)
     simulation_params_serializable = _sanitize_params_for_hdf5(simulation_params)
     
@@ -557,11 +530,9 @@ def simulate_alignment_warp(
     if 'verbose' not in simulation_params:
         simulation_params['verbose'] = True
     
-    # Step 1: Generate original simulated data using single slice simulator
     print("Generating original dataset using simulate_single_slice...")
     original_simulated = simulate_single_slice(adata, **simulation_params)
     
-    # Step 2: Apply TPS warping transformation
     print("Applying TPS warping transformation...")
     warp_transformer = WarpTransformer(
         original_simulated,
@@ -581,7 +552,6 @@ def simulate_alignment_warp(
         if removed_n > 0:
             print(f"Filtered {removed_n} edge spots (margin_ratio={edge_margin_ratio:.3f}) from warped slice")
 
-    # Step 3: Add metadata
     # Convert AlterationConfig to dict if present (needed for HDF5 serialization)
     simulation_params_serializable = _sanitize_params_for_hdf5(simulation_params)
     
@@ -631,7 +601,6 @@ def generate_alignment_benchmark_suite(
     """
     print("Generating comprehensive alignment benchmark suite using simulate_single_slice")
     
-    # Set default transformations if none provided
     if transformations is None:
         transformations = {
             # Rotation transformations
@@ -660,14 +629,12 @@ def generate_alignment_benchmark_suite(
             },
         }
     
-    # Prepare simulation parameters by merging fit_params and expression_params
     simulation_params = {}
     if fit_params:
         simulation_params.update(fit_params)
     if expression_params:
         simulation_params.update(expression_params)
     
-    # Set defaults
     if 'verbose' not in simulation_params:
         simulation_params['verbose'] = True
     
@@ -763,9 +730,6 @@ def generate_alignment_benchmark_suite(
     return results
 
 
-# -------------------------------
-# Helper: filter edge spots
-# -------------------------------
 def _filter_edge_spots(adata: ad.AnnData, margin_ratio: float = 0.03) -> ad.AnnData:
     """
     Remove spots that lie within a margin band along the bounding-box edges.
@@ -789,10 +753,8 @@ def _filter_edge_spots(adata: ad.AnnData, margin_ratio: float = 0.03) -> ad.AnnD
     y = coords[:, 1]
     x_min, x_max = float(np.min(x)), float(np.max(x))
     y_min, y_max = float(np.min(y)), float(np.max(y))
-    # Compute margins along each axis
     mx = (x_max - x_min) * float(margin_ratio)
     my = (y_max - y_min) * float(margin_ratio)
-    # Keep only interior spots
     mask = (x > x_min + mx) & (x < x_max - mx) & (y > y_min + my) & (y < y_max - my)
     if np.all(mask):
         return adata
