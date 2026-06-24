@@ -16,9 +16,6 @@ import pandas as pd
 from scipy.linalg import LinAlgError, cho_factor, cho_solve
 
 
-# ---------------------------------------------------------------------------
-# Core penalty matrix
-# ---------------------------------------------------------------------------
 
 
 def z_penalty_matrix(
@@ -78,9 +75,6 @@ def z_penalty_matrix(
     return penalty
 
 
-# ---------------------------------------------------------------------------
-# Anchor weight
-# ---------------------------------------------------------------------------
 
 
 def class_anchor_weight(n_spots: int, multiplier: float = 1.0) -> float:
@@ -91,9 +85,6 @@ def class_anchor_weight(n_spots: int, multiplier: float = 1.0) -> float:
     return float(multiplier) * max(1.0, math.log1p(max(0, int(n_spots))))
 
 
-# ---------------------------------------------------------------------------
-# Core smoothing solve
-# ---------------------------------------------------------------------------
 
 
 def regularize_mean_profiles(
@@ -143,9 +134,6 @@ def regularize_mean_profiles(
     return np.expm1(np.clip(solved_log, 0.0, None))
 
 
-# ---------------------------------------------------------------------------
-# Count rescaling
-# ---------------------------------------------------------------------------
 
 
 def calibrate_counts_to_regularized_means(
@@ -221,9 +209,6 @@ def _safe_pearson(left: Sequence[float], right: Sequence[float]) -> float:
     return float(np.sum(left_centered * right_centered) / denominator)
 
 
-# ---------------------------------------------------------------------------
-# Z-coherence metrics
-# ---------------------------------------------------------------------------
 
 
 def compute_z_coherence(

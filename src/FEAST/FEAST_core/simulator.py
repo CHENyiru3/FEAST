@@ -21,7 +21,6 @@ MAX_DENSE_OT_SPOTS = 50_000
 
 # Internal translation: public parameter_mode ↔ internal simulation_mode
 _PARAMETER_TO_SIMULATION = {"hungarian": "generative", "reference_stats": "empirical"}
-_SIMULATION_TO_PARAMETER = {"generative": "hungarian", "empirical": "reference_stats"}
 
 
 def _translate_parameter_mode(parameter_mode):
@@ -42,9 +41,11 @@ def _translate_spatial_mode(spatial_mode):
 
 def safe_calculate_qc_metrics(adata, verbose=False):
     try:
-        if adata.n_vars > 0 and adata.n_obs > 0: sc.pp.calculate_qc_metrics(adata, percent_top=[20, 50, 100] if adata.n_vars > 100 else [50], inplace=True, log1p=False)
-    except Exception as e:
-        if verbose: print(f"Warning: QC calculation failed ({e}), using basic metrics only")
+        if adata.n_vars > 0 and adata.n_obs > 0:
+            sc.pp.calculate_qc_metrics(adata, percent_top=[20, 50, 100] if adata.n_vars > 100 else [50], inplace=True, log1p=False)
+    except (ValueError, TypeError, ImportError) as e:
+        if verbose:
+            print(f"Warning: QC calculation failed ({e}), using basic metrics only")
         adata.obs['total_counts'] = np.asarray(adata.X.sum(axis=1)).flatten()
         adata.obs['n_genes_by_counts'] = np.asarray((adata.X > 0).sum(axis=1)).flatten()
         adata.var['total_counts'] = np.asarray(adata.X.sum(axis=0)).flatten()
@@ -86,7 +87,7 @@ def _hdf5_safe_metadata(value):
     return value
 
 
-def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_search=True, min_accepted_error=0.5, assignment_weights=None, screening_pool_size=100, top_n_to_fully_evaluate=10, n_jobs=-1, alteration_config=None, simulation_mode='generative', spatial_mode='reference_rank', assignment_method='hybrid', random_seed=None, hybrid_alpha=0.2):
+def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_search=True, min_accepted_error=0.5, assignment_weights=None, screening_pool_size=100, top_n_to_fully_evaluate=10, n_jobs=-1, alteration_config=None, simulation_mode='generative', spatial_mode='reference_rank', assignment_method='hybrid', random_seed=None, hybrid_alpha=0.2, use_distributional_alteration=False):
     """
     Build an integrated FEAST gene-parameter table and convert it to count-model parameters.
 
@@ -94,6 +95,8 @@ def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_searc
         alteration_config (AlterationConfig or dict, optional): Configuration for altering marginal distributions
         hybrid_alpha (float): Weight for log-space distance in hybrid OT cost (0.2 = 20% log, 80% raw).
                               Set to 1.0 for old pure-log-space behavior.
+        use_distributional_alteration (bool): If True, alter marginal model parameters (θ → θ')
+            before sampling.  If False (default), apply scalar fold-change after sampling (legacy).
     """
     print("\n>>> Entering STANDARD fitting pipeline: parameter_cloud <<<")
 
@@ -122,6 +125,7 @@ def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_searc
         random_seed=random_seed,
         assignment_method=assignment_method,
         verbose=True,
+        use_distributional_alteration=use_distributional_alteration,
     )
 
     model_params = convert_params_for_new_simulator(
@@ -138,7 +142,7 @@ def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_searc
     return model_params
 
 def run_direct_fitting_from_real_stats(adata):
-    """This diagnostic pipeline remains unchanged."""
+    """Run diagnostic pipeline using real stats directly."""
     print("\n>>> Entering DIAGNOSTIC fitting pipeline: Using REAL stats directly <<<")
     simulator = GeneParameterSimulator()
     simulator.fit_statistics_only(adata)
@@ -152,6 +156,97 @@ def run_direct_fitting_from_real_stats(adata):
     return model_params
 
 
+def simulate_batch_effect(
+    adata_ref,
+    D: np.ndarray,
+    b: np.ndarray,
+    alpha: float = 1.0,
+    *,
+    random_seed=None,
+    boundary_multiplier: float = 1.1,
+) -> "ad.AnnData":
+    """Simulate a batch-affected slice from a reference AnnData.
+
+    Pipeline:
+      1. Extract per-gene stats from reference   -> _gene_stats_from_matrix()
+      2. Convert stats to theta                   -> stats_to_theta()
+      3. Apply affine deformation                 -> apply_batch_deformation()
+      4. Convert back to stats                    -> theta_to_stats()
+      5. Convert stats to count-model params      -> convert_params_for_new_simulator()
+      6. Decode counts preserving spatial rank    -> decode_counts_by_rank()
+
+    Parameters
+    ----------
+    adata_ref : AnnData   -- reference (clean) slice
+    D : (3,) ndarray      -- diagonal scaling coefficients
+    b : (3,) ndarray      -- shift vector
+    alpha : float         -- interpolation strength (0 = no effect, 1 = full)
+    random_seed : int, optional
+    boundary_multiplier : float
+
+    Returns
+    -------
+    adata_sim : AnnData   -- batch-affected slice with preserved spatial pattern
+    """
+    from scipy.sparse import issparse
+    from .theta_transform import stats_to_theta, theta_to_stats
+    from .parameter_cloud import apply_batch_deformation, convert_params_for_new_simulator
+    from .count_decoding import decode_counts_by_rank
+
+    ref_matrix = adata_ref.X.toarray() if issparse(adata_ref.X) else np.asarray(
+        adata_ref.X, dtype=np.float64
+    )
+    n_obs = ref_matrix.shape[0]
+    gene_names = list(adata_ref.var_names)
+
+    stats_ref = _gene_stats_from_matrix(ref_matrix, gene_names)
+    theta_ref = stats_to_theta(stats_ref)
+    theta_batch = apply_batch_deformation(theta_ref, D, b, alpha)
+    stats_batch = theta_to_stats(theta_batch).clip(lower=1e-10)
+
+    stats_for_conversion = stats_batch.copy()
+    stats_for_conversion.index = gene_names
+    stats_for_conversion = stats_for_conversion.reset_index().rename(
+        columns={"index": "gene_id"}
+    )
+    model_params = convert_params_for_new_simulator(
+        stats_for_conversion, n_spots=n_obs, boundary_multiplier=boundary_multiplier
+    )
+    model_params["simulation_mode"] = "empirical"
+
+    simulated_matrix = decode_counts_by_rank(
+        ref_matrix.astype(np.float64),
+        model_params,
+        boundary_multiplier=boundary_multiplier,
+        reference_X=ref_matrix,
+        random_seed=random_seed,
+    )
+
+    sim_adata = ad.AnnData(
+        X=simulated_matrix.astype(np.float32),
+        obs=adata_ref.obs.copy(),
+        var=adata_ref.var.copy(),
+        obsm={k: v.copy() for k, v in adata_ref.obsm.items()},
+    )
+    if hasattr(adata_ref, "uns") and adata_ref.uns:
+        sim_adata.uns = adata_ref.uns.copy()
+    else:
+        sim_adata.uns = {}
+
+    sim_adata.uns["batch_deformation"] = {
+        "D": D.tolist(),
+        "b": b.tolist(),
+        "alpha": alpha,
+    }
+    sim_adata.var["theta_mu_ref"] = theta_ref[:, 0]
+    sim_adata.var["theta_omega_ref"] = theta_ref[:, 1]
+    sim_adata.var["theta_pi0_ref"] = theta_ref[:, 2]
+    sim_adata.var["theta_mu_batch"] = theta_batch[:, 0]
+    sim_adata.var["theta_omega_batch"] = theta_batch[:, 1]
+    sim_adata.var["theta_pi0_batch"] = theta_batch[:, 2]
+    return sim_adata
+
+
 class SpatialSimulator:
     def __init__(self, reference_adata: ad.AnnData, model_params: dict = None):
         if 'spatial' not in reference_adata.obsm: raise ValueError("Reference AnnData must contain 'spatial' coordinates.")
@@ -160,17 +255,18 @@ class SpatialSimulator:
         self.reference_adata.obs_names_make_unique()
         self._model_params = model_params
 
-    def fit_model(self, visualize_fits: bool = False, use_real_stats_directly: bool = False, use_heuristic_search: bool = False, min_accepted_error: float = 0.5, assignment_weights: dict = None, screening_pool_size: int = 100, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, simulation_mode: str = 'generative', spatial_mode: str = 'reference_rank', assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2) -> 'SpatialSimulator':
+    def fit_model(self, visualize_fits: bool = False, use_real_stats_directly: bool = False, use_heuristic_search: bool = False, min_accepted_error: float = 0.5, assignment_weights: dict = None, screening_pool_size: int = 100, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, simulation_mode: str = 'generative', spatial_mode: str = 'reference_rank', assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2, use_distributional_alteration: bool = False) -> 'SpatialSimulator':
         """
-        UPDATED: Exposes the new boosted heuristic search parameters and marginal distribution alteration.
-        
+        Exposes heuristic search parameters and marginal distribution alteration.
+
         Args:
             alteration_config (AlterationConfig or dict, optional): Configuration for altering marginal distributions
+            use_distributional_alteration (bool): If True, alter marginal model parameters before sampling.
         """
         adata_for_fitting = self.reference_adata.copy(); safe_calculate_qc_metrics(adata_for_fitting)
-        if use_real_stats_directly: 
+        if use_real_stats_directly:
             self._model_params = run_direct_fitting_from_real_stats(adata_for_fitting)
-        else: 
+        else:
             self._model_params = run_parameter_cloud_fitting(
                 adata_for_fitting,
                 visualize_fits=visualize_fits,
@@ -186,6 +282,7 @@ class SpatialSimulator:
                 assignment_method=assignment_method,
                 random_seed=random_seed,
                 hybrid_alpha=hybrid_alpha,
+                use_distributional_alteration=use_distributional_alteration,
             )
         return self
     
@@ -397,470 +494,6 @@ class SpatialSimulator:
         }
         return diagnostics
     
-    def _apply_deterministic_rank_assignment(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, n_modules=30, n_neighbors=6):
-        """Generate counts from model parameters while preserving per-gene reference ranks."""
-        reference_matrix = reference_adata.X.toarray() if hasattr(reference_adata.X, 'toarray') else reference_adata.X.copy()
-        spatial_coords = reference_adata.obsm['spatial']
-
-        if verbose:
-            print("Applying deterministic rank-preserving assignment...")
-
-        new_counts = self._generate_counts_from_parameters(reference_adata, model_params, verbose, boundary_multiplier)
-        simulated_matrix = np.zeros_like(reference_matrix, dtype=np.float32)
-
-        for gene_idx in range(reference_matrix.shape[1]):
-            original_spatial_ranks = np.argsort(reference_matrix[:, gene_idx], kind="mergesort")
-            new_values_sorted = np.sort(new_counts[:, gene_idx])
-            simulated_matrix[original_spatial_ranks, gene_idx] = new_values_sorted
-        
-        if clip_overshoot_factor > 0:
-            max_ref_counts = np.max(reference_matrix, axis=0)
-            clip_max = max_ref_counts * (1 + clip_overshoot_factor)
-            simulated_matrix = np.clip(simulated_matrix, 0, clip_max)
-        
-        simulated_adata = ad.AnnData(
-            X=simulated_matrix.astype(np.float32),
-            obs=reference_adata.obs.copy(),
-            var=reference_adata.var.copy(),
-            obsm={'spatial': spatial_coords.copy()}
-        )
-        simulated_adata.uns['simulation_method'] = 'Deterministic_Rank_Preservation'
-        simulated_adata.uns['simulation_params'] = {
-            'clip_overshoot_factor': clip_overshoot_factor
-        }
-        return simulated_adata
-    
-    def _find_gene_modules(self, new_counts, n_modules, verbose=False):
-        """Find co-expression modules and their leader genes using NMF."""
-        from sklearn.decomposition import NMF
-        
-        # Ensure we don't request more modules than genes
-        n_modules = min(n_modules, new_counts.shape[1] // 2)
-        
-        if verbose:
-            print(f"Running NMF with {n_modules} components...")
-        
-        # NMF to find additive parts-based representations
-        model = NMF(n_components=n_modules, init='random', random_state=42, max_iter=500)
-        try:
-            W = model.fit_transform(new_counts)  # spot loadings for each module
-            H = model.components_  # gene loadings for each module
-        except Exception as e:
-            if verbose:
-                print(f"NMF failed ({e}), using simple clustering fallback")
-            return self._simple_gene_clustering(new_counts, n_modules)
-        
-        # For each module, find the gene with highest loading (the "leader")
-        leader_genes_indices = np.argmax(H, axis=1)
-        
-        # Assign each gene to the module where it has highest loading
-        gene_modules = [[] for _ in range(n_modules)]
-        gene_to_module_map = np.argmax(H, axis=0)
-        
-        for gene_idx, module_idx in enumerate(gene_to_module_map):
-            gene_modules[module_idx].append(gene_idx)
-        
-        if verbose:
-            module_sizes = [len(module) for module in gene_modules]
-            print(f"Created modules with sizes: {module_sizes}")
-        
-        return gene_modules, leader_genes_indices
-    
-    def _simple_gene_clustering(self, new_counts, n_modules):
-        """Fallback clustering method if NMF fails."""
-        n_genes = new_counts.shape[1]
-        genes_per_module = n_genes // n_modules
-        
-        gene_modules = []
-        leader_genes_indices = []
-        
-        for i in range(n_modules):
-            start_idx = i * genes_per_module
-            end_idx = start_idx + genes_per_module if i < n_modules - 1 else n_genes
-            module_genes = list(range(start_idx, end_idx))
-            gene_modules.append(module_genes)
-            leader_genes_indices.append(start_idx)  # First gene as leader
-        
-        return gene_modules, np.array(leader_genes_indices)
-    
-    def _create_spatial_smoother(self, spatial_coords, n_neighbors):
-        """Create a normalized adjacency matrix for spatial smoothing."""
-        from sklearn.neighbors import kneighbors_graph
-        from scipy.sparse import csgraph
-        
-        # Build k-NN graph
-        adj_matrix = kneighbors_graph(
-            spatial_coords, 
-            n_neighbors=min(n_neighbors, len(spatial_coords)-1), 
-            mode='connectivity', 
-            include_self=True
-        )
-        
-        # Normalize to create smoothing operator
-        smoother = adj_matrix / adj_matrix.sum(axis=1)
-        
-        return smoother
-    
-    def _guided_assignment_core(self, reference_matrix, new_counts, spatial_smoother,
-                               gene_modules, leader_genes_indices, verbose=False):
-        """Compatibility wrapper for deterministic rank assignment."""
-        n_spots, n_genes = reference_matrix.shape
-        S_final = np.zeros_like(reference_matrix, dtype=np.float32)
-        reference_ranks = np.argsort(reference_matrix, axis=0)
-        new_counts_ranks = np.argsort(new_counts, axis=0)
-        shuffled_indices = np.arange(n_spots, dtype=int)
-        for gene_idx in range(n_genes):
-            assigned_indices = new_counts_ranks[shuffled_indices, gene_idx]
-            S_final[reference_ranks[:, gene_idx], gene_idx] = \
-                new_counts[assigned_indices, gene_idx]
-        return S_final
-    
-    def _resolve_assignment_conflicts(self, assignment_map):
-        """
-        Resolve conflicts when multiple ranks are assigned to the same spot.
-        Use a greedy approach to ensure each spot gets exactly one rank.
-        """
-        n_spots = len(assignment_map)
-        resolved_map = np.zeros(n_spots, dtype=int)
-        used_spots = set()
-        
-        # First pass: assign non-conflicting mappings
-        conflicts = []
-        for rank in range(n_spots):
-            target_spot = assignment_map[rank]
-            if target_spot not in used_spots:
-                resolved_map[rank] = target_spot
-                used_spots.add(target_spot)
-            else:
-                conflicts.append(rank)
-        
-        # Second pass: resolve conflicts by assigning to unused spots
-        available_spots = [i for i in range(n_spots) if i not in used_spots]
-        
-        for i, rank in enumerate(conflicts):
-            if i < len(available_spots):
-                resolved_map[rank] = available_spots[i]
-            else:
-                # Fallback: assign to any remaining spot (shouldn't happen with proper implementation)
-                resolved_map[rank] = rank
-        
-        return resolved_map
-    
-    def _generate_counts_from_parameters(self, reference_adata, model_params, verbose=False, boundary_multiplier=1.1):
-        """Generate new count matrix from fitted statistical distribution parameters.
-        
-        Args:
-            boundary_multiplier (float): Multiplier for maximum count boundary constraint (default 1.1 = 110% of reference max)
-        """
-        if verbose:
-            print("Generating new counts from fitted statistical distributions...")
-        
-        # Extract the fitted distribution parameters
-        if 'genes' not in model_params or 'model_selected' not in model_params or 'marginal_param1' not in model_params:
-            if verbose:
-                print("Warning: model_params missing required keys, falling back to reference-based simulation")
-            return self._fallback_reference_based_simulation(reference_adata, boundary_multiplier)
-        
-        n_spots, n_genes = reference_adata.shape
-        new_counts = np.zeros((n_spots, n_genes), dtype=np.float32)
-        
-        # Calculate maximum counts per gene from reference data for boundary constraint
-        reference_matrix = reference_adata.X.toarray() if hasattr(reference_adata.X, 'toarray') else reference_adata.X
-        max_counts_per_gene = np.max(reference_matrix, axis=0)
-        # Set boundary using the tunable multiplier
-        boundary_per_gene = max_counts_per_gene * boundary_multiplier
-        
-        if verbose:
-            print(f"Applying {boundary_multiplier*100:.0f}% boundary constraint based on reference max counts")
-            print(f"Max reference counts range: [{np.min(max_counts_per_gene):.1f}, {np.max(max_counts_per_gene):.1f}]")
-            print(f"Boundary range: [{np.min(boundary_per_gene):.1f}, {np.max(boundary_per_gene):.1f}]")
-        
-        # Sample from fitted distributions for each gene
-        for gene_idx in range(n_genes):
-            if gene_idx >= len(model_params['model_selected']) or gene_idx >= len(model_params['marginal_param1']):
-                if verbose:
-                    print(f"Warning: No parameters for gene {gene_idx}, using reference values")
-                if hasattr(reference_adata.X, 'toarray'):
-                    new_counts[:, gene_idx] = reference_adata.X[:, gene_idx].toarray().flatten()
-                else:
-                    new_counts[:, gene_idx] = reference_adata.X[:, gene_idx]
-                continue
-            
-            model_type = model_params['model_selected'][gene_idx]
-            params = model_params['marginal_param1'][gene_idx]  # [pi0, r, mean_param]
-            
-            try:
-                # Ensure params has enough elements - pad with defaults if needed
-                if not isinstance(params, (list, tuple, np.ndarray)) or len(params) < 3:
-                    # Pad with safe defaults: [pi0=0.1, r=1.0, mean_param=1.0]
-                    params_safe = [0.1, 1.0, 1.0]
-                    if isinstance(params, (list, tuple, np.ndarray)):
-                        for i in range(min(len(params), 3)):
-                            if i < len(params) and np.isfinite(params[i]):
-                                params_safe[i] = params[i]
-                    params = params_safe
-                    if verbose:
-                        print(f"Warning: Gene {gene_idx} has insufficient parameters ({len(model_params['marginal_param1'][gene_idx]) if isinstance(model_params['marginal_param1'][gene_idx], (list, tuple, np.ndarray)) else 0}), using defaults")
-                
-                # Safe parameter extraction with bounds checking
-                def safe_param(idx, default_val):
-                    try:
-                        if idx < len(params) and np.isfinite(params[idx]):
-                            return max(params[idx], 1e-8) if idx > 0 else np.clip(params[idx], 0, 1) if idx == 0 else params[idx]
-                        return default_val
-                    except (IndexError, TypeError):
-                        return default_val
-                
-                # Sample from the appropriate distribution using safe parameter extraction
-                if model_type == 'Poisson':
-                    lambda_param = safe_param(2, 1.0)  # mean_param
-                    gene_counts = np.random.poisson(lambda_param, size=n_spots)
-                
-                elif model_type == 'NB':  # Negative Binomial
-                    mu = safe_param(2, 1.0)  # mean_param
-                    r = safe_param(1, 1000.0)  # dispersion
-                    
-                    # Convert to n, p parameterization for numpy with validation
-                    if mu <= 0 or r <= 0:
-                        # Fallback to Poisson if NB parameters are invalid
-                        gene_counts = np.random.poisson(max(mu, 1e-8), size=n_spots)
-                    else:
-                        p = r / (r + mu)
-                        n = r
-                        
-                        # Validate NB parameters
-                        if not (0 < p <= 1 and n > 0):
-                            # Fallback to Poisson if parameters are still invalid
-                            gene_counts = np.random.poisson(mu, size=n_spots)
-                        else:
-                            gene_counts = np.random.negative_binomial(n, p, size=n_spots)
-                
-                elif model_type == 'ZIP':  # Zero-Inflated Poisson
-                    pi0 = safe_param(0, 0.1)  # zero inflation probability
-                    lambda_param = safe_param(2, 1.0)  # mean_param
-                    
-                    # Sample zero inflation
-                    zero_mask = np.random.binomial(1, pi0, size=n_spots).astype(bool)
-                    gene_counts = np.random.poisson(lambda_param, size=n_spots)
-                    gene_counts[zero_mask] = 0
-                
-                elif model_type == 'ZINB':  # Zero-Inflated Negative Binomial
-                    pi0 = safe_param(0, 0.1)  # zero inflation probability
-                    mu = safe_param(2, 1.0)  # mean_param  
-                    r = safe_param(1, 1000.0)  # dispersion
-                    
-                    # Convert to n, p parameterization for numpy with validation
-                    if mu <= 0 or r <= 0:
-                        # Fallback to Poisson if NB parameters are invalid
-                        gene_counts = np.random.poisson(max(mu, 1e-8), size=n_spots)
-                    else:
-                        p = r / (r + mu)
-                        n = r
-                        
-                        # Validate NB parameters
-                        if not (0 < p <= 1 and n > 0):
-                            # Fallback to Poisson if parameters are still invalid
-                            gene_counts = np.random.poisson(mu, size=n_spots)
-                        else:
-                            # Sample zero inflation
-                            zero_mask = np.random.binomial(1, pi0, size=n_spots).astype(bool)
-                            gene_counts = np.random.negative_binomial(n, p, size=n_spots)
-                            gene_counts[zero_mask] = 0
-                
-                else:
-                    if verbose:
-                        print(f"Warning: Unknown model type '{model_type}' for gene {gene_idx}, using Poisson fallback")
-                    lambda_param = safe_param(2, 1.0)
-                    gene_counts = np.random.poisson(lambda_param, size=n_spots)
-                
-                new_counts[:, gene_idx] = gene_counts.astype(np.float32)
-                
-                # Apply boundary constraint: resample until all values within boundary
-                gene_boundary = boundary_per_gene[gene_idx]
-                violations_mask = new_counts[:, gene_idx] > gene_boundary
-                n_violations = np.sum(violations_mask)
-                
-                if n_violations > 0:
-                    violation_indices = np.where(violations_mask)[0]
-                    n_resampled = 0
-                    max_resample_attempts = 100  # Prevent infinite loops
-                    
-                    # Resample violations using the same distribution until all within boundary
-                    for attempt in range(max_resample_attempts):
-                        if n_violations == 0:
-                            break
-                            
-                        # Resample based on the fitted distribution using safe parameter access
-                        if model_type == 'Poisson':
-                            lambda_param = safe_param(2, 1.0)
-                            resampled_values = np.random.poisson(lambda_param, size=n_violations)
-                            
-                        elif model_type == 'NB':
-                            mu = safe_param(2, 1.0)
-                            alpha = safe_param(1, 1000.0)  # Use r instead of alpha for consistency
-                            if mu <= 0 or alpha <= 0:
-                                resampled_values = np.random.poisson(max(mu, 1e-8), size=n_violations)
-                            else:
-                                p = alpha / (alpha + mu)
-                                n = alpha
-                                p = np.clip(p, 1e-8, 1-1e-8)
-                                resampled_values = np.random.negative_binomial(n, p, size=n_violations)
-                            
-                        elif model_type == 'ZIP':
-                            pi0 = safe_param(0, 0.1)
-                            lambda_param = safe_param(2, 1.0)
-                            zero_mask = np.random.random(n_violations) < pi0
-                            resampled_values = np.random.poisson(lambda_param, size=n_violations)
-                            resampled_values[zero_mask] = 0
-                            
-                        elif model_type == 'ZINB':
-                            pi0 = safe_param(0, 0.1)
-                            mu = safe_param(2, 1.0)
-                            alpha = safe_param(1, 1000.0)  # Use r instead of alpha for consistency
-                            if mu <= 0 or alpha <= 0:
-                                resampled_values = np.random.poisson(max(mu, 1e-8), size=n_violations)
-                            else:
-                                p = alpha / (alpha + mu)
-                                n = alpha
-                                p = np.clip(p, 1e-8, 1-1e-8)
-                                zero_mask = np.random.random(n_violations) < pi0
-                                resampled_values = np.random.negative_binomial(n, p, size=n_violations)
-                                resampled_values[zero_mask] = 0
-                            
-                        else:
-                            # Fallback to Poisson
-                            lambda_param = safe_param(2, 1.0)
-                            resampled_values = np.random.poisson(lambda_param, size=n_violations)
-                        
-                        # Only keep values within boundary
-                        valid_mask = resampled_values <= gene_boundary
-                        valid_values = resampled_values[valid_mask]
-                        n_valid = len(valid_values)
-                        
-                        if n_valid > 0:
-                            # Replace the first n_valid violations with valid resampled values
-                            update_indices = violation_indices[:n_valid]
-                            new_counts[update_indices, gene_idx] = valid_values.astype(np.float32)
-                            n_resampled += n_valid
-                            
-                            # Update violation tracking
-                            violation_indices = violation_indices[n_valid:]
-                            n_violations = len(violation_indices)
-                    
-                    # If still have violations after max attempts, use truncated uniform sampling
-                    if n_violations > 0:
-                        # Sample uniformly within [0, gene_boundary] for remaining violations
-                        uniform_values = np.random.uniform(0, gene_boundary, size=n_violations)
-                        new_counts[violation_indices, gene_idx] = uniform_values.astype(np.float32)
-                        n_resampled += n_violations
-                    
-                    if verbose and n_resampled > 0:
-                        print(f"  Gene {gene_idx}: Resampled {n_resampled} values to respect boundary {gene_boundary:.1f}")
-                
-            except Exception as e:
-                if verbose:
-                    print(f"Warning: Sampling failed for gene {gene_idx} with model {model_type}: {e}")
-                # Fallback to reference values
-                if hasattr(reference_adata.X, 'toarray'):
-                    new_counts[:, gene_idx] = reference_adata.X[:, gene_idx].toarray().flatten()
-                else:
-                    new_counts[:, gene_idx] = reference_adata.X[:, gene_idx]
-        
-        if verbose:
-            print(f"Generated counts from distributions: Poisson={np.sum(np.array(model_params['model_selected']) == 'Poisson')}, " +
-                  f"NB={np.sum(np.array(model_params['model_selected']) == 'NB')}, " +
-                  f"ZIP={np.sum(np.array(model_params['model_selected']) == 'ZIP')}, " +
-                  f"ZINB={np.sum(np.array(model_params['model_selected']) == 'ZINB')}")
-            
-            # Report boundary constraint effectiveness
-            n_genes_clipped = np.sum(np.max(new_counts, axis=0) >= boundary_per_gene * 0.99)  # Close to boundary
-            print(f"Boundary constraint applied to {n_genes_clipped}/{n_genes} genes")
-            print(f"Final count range: [{np.min(new_counts):.1f}, {np.max(new_counts):.1f}]")
-        
-        return new_counts
-    
-    def _fallback_reference_based_simulation(self, reference_adata, boundary_multiplier=1.1):
-        """Fallback method when proper parameters are not available.
-        
-        Args:
-            boundary_multiplier (float): Multiplier for maximum count boundary constraint (default 1.1 = 110% of reference max)
-        """
-        reference_matrix = reference_adata.X.toarray() if hasattr(reference_adata.X, 'toarray') else reference_adata.X.copy()
-        
-        # Calculate boundary using the tunable multiplier
-        max_counts_per_gene = np.max(reference_matrix, axis=0)
-        boundary_per_gene = max_counts_per_gene * boundary_multiplier
-        
-        # Add some biological variation while preserving overall structure
-        noise_factor = 0.1
-        biological_noise = np.random.gamma(2, 0.5, reference_matrix.shape)
-        new_counts = reference_matrix * biological_noise * (1 + noise_factor * np.random.randn(*reference_matrix.shape))
-        
-        # Ensure non-negative and integer counts
-        new_counts = np.maximum(new_counts, 0)
-        new_counts = np.round(new_counts).astype(np.float32)
-        
-        # Apply boundary constraint: resample until all values within 110% boundary
-        for gene_idx in range(new_counts.shape[1]):
-            gene_boundary = boundary_per_gene[gene_idx]
-            violations_mask = new_counts[:, gene_idx] > gene_boundary
-            n_violations = np.sum(violations_mask)
-            
-            if n_violations > 0:
-                violation_indices = np.where(violations_mask)[0]
-                max_resample_attempts = 50  # Fewer attempts for fallback method
-                
-                for attempt in range(max_resample_attempts):
-                    if n_violations == 0:
-                        break
-                    
-                    # Use gamma distribution resampling for biological variation
-                    shape = 2
-                    scale = gene_boundary / (shape * 2)  # Scale to keep mean around boundary/2
-                    resampled_values = np.random.gamma(shape, scale, size=n_violations)
-                    
-                    # Only keep values within boundary
-                    valid_mask = resampled_values <= gene_boundary
-                    valid_values = resampled_values[valid_mask]
-                    n_valid = len(valid_values)
-                    
-                    if n_valid > 0:
-                        update_indices = violation_indices[:n_valid]
-                        new_counts[update_indices, gene_idx] = valid_values.astype(np.float32)
-                        violation_indices = violation_indices[n_valid:]
-                        n_violations = len(violation_indices)
-                
-                # Final fallback: uniform sampling within boundary
-                if n_violations > 0:
-                    uniform_values = np.random.uniform(0, gene_boundary, size=n_violations)
-                    new_counts[violation_indices, gene_idx] = uniform_values.astype(np.float32)
-        
-        return new_counts
-    
-    def _apply_simple_parameter_assignment(self, reference_adata, model_params, verbose=False):
-        """Fallback method for environments missing optional assignment dependencies."""
-        if verbose:
-            print("Using simplified parameter assignment (fallback mode)...")
-        
-        simulated_adata = reference_adata.copy()
-        
-        # Apply some basic variation to the reference data
-        reference_matrix = simulated_adata.X.toarray() if hasattr(simulated_adata.X, 'toarray') else simulated_adata.X.copy()
-        
-        # Add controlled biological variation
-        variation = np.random.gamma(1.2, 0.8, reference_matrix.shape)
-        simulated_matrix = reference_matrix * variation
-        simulated_matrix = np.maximum(simulated_matrix, 0)
-        
-        simulated_adata.X = simulated_matrix.astype(np.float32)
-        simulated_adata.uns['simulation_method'] = 'simple_fallback'
-        
-        return simulated_adata
-    
-    def simulate_slice(self, **kwargs):
-        """Convenience method for single slice simulation with parameter validation."""
-        return self.simulate(**kwargs)
-
     def simulate_by_annotation(self, annotation_key: str, **kwargs) -> ad.AnnData:
         """Compatibility path for annotation-key callers."""
         if annotation_key not in self.reference_adata.obs:
@@ -882,6 +515,7 @@ class SpatialSimulator:
             "assignment_method": kwargs.get("assignment_method", "hybrid"),
             "random_seed": kwargs.get("random_seed"),
             "hybrid_alpha": kwargs.get("hybrid_alpha", 0.2),
+            "use_distributional_alteration": kwargs.get("use_distributional_alteration", False),
         }
         self.fit_model(**fit_kwargs)
         simulated = self.simulate(
@@ -974,7 +608,7 @@ def _block_ot_transport(reference_matrix, source_coords, target_coords, reg=0.05
     return transported
 
 
-def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, parameter_mode: str = 'hungarian', spatial_mode: str = 'reference_rank', target_adata=None, assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2) -> ad.AnnData:
+def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, parameter_mode: str = 'hungarian', spatial_mode: str = 'reference_rank', target_adata=None, assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2, use_distributional_alteration: bool = False) -> ad.AnnData:
     """
     Run single-slice simulation.
 
@@ -986,8 +620,8 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
         target_adata: Target AnnData for ot_spatial mode (required when spatial_mode='ot_spatial').
         assignment_method: 'hybrid' or 'copula_rank' — only meaningful when parameter_mode='hungarian'.
         random_seed: Optional seed for reproducible generative sampling.
+        use_distributional_alteration: If True, alter marginal model parameters (θ → θ').
     """
-    # --- translate public API → internal naming ---
     simulation_mode = _translate_parameter_mode(parameter_mode)
     spatial_mode = _translate_spatial_mode(spatial_mode)
     if spatial_mode == "ot_spatial" and target_adata is None:
@@ -1005,7 +639,6 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
     safe_calculate_qc_metrics(adata, verbose=verbose)
     simulator = SpatialSimulator(adata)
     
-    # Combine heuristic search parameters into kwargs to pass them down easily
     heuristic_kwargs = {
         'use_heuristic_search': use_heuristic_search,
         'min_accepted_error': min_accepted_error,
@@ -1018,6 +651,7 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
         'assignment_method': assignment_method,
         'random_seed': random_seed,
         'hybrid_alpha': hybrid_alpha,
+        'use_distributional_alteration': use_distributional_alteration,
     }
 
     if annotation_key:

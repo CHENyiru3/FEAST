@@ -76,14 +76,10 @@ def calculate_cell_type_proportions_for_lowres(cell_types, assignments, n_lowres
     unique_cell_types = np.unique(cell_types)
     proportions = np.zeros((n_lowres_spots, len(unique_cell_types)))
     
-    # For each low-resolution spot, calculate cell type proportions
     for i in range(n_lowres_spots):
-        # Find which original spots are assigned to this low-resolution spot
         mask = assignments == i
         if np.sum(mask) > 0:
-            # Get cell types of assigned spots
             spot_cell_types = cell_types[mask]
-            # Calculate proportions
             for j, cell_type in enumerate(unique_cell_types):
                 proportions[i, j] = np.sum(spot_cell_types == cell_type) / len(spot_cell_types)
     
@@ -137,32 +133,24 @@ def create_deconvolution_benchmark_data(adata, downsampling_factor=0.25, grid_ty
     AnnData
         Lower-resolution ST data with ground truth proportions
     """
-    # Extract spatial coordinates and expression matrix
     original_coords = adata.obsm['spatial']
     
-    # Convert expression matrix to dense if it's sparse
     if isinstance(adata.X, np.ndarray):
         expression_matrix = adata.X
     else:
         expression_matrix = adata.X.toarray()
     
-    # Generate low-resolution grid
     lowres_grid = create_low_resolution_grid(original_coords, downsampling_factor, grid_type)
     
-    # Filter grid to tissue shape
     lowres_grid = filter_grid_to_tissue_shape(original_coords, lowres_grid, alpha)
     
-    # Assign original spots to low-resolution grid points
     assignments = assign_original_spots_to_grid(original_coords, lowres_grid)
     
-    # Aggregate gene expression
     aggregated_counts = aggregate_gene_expression(expression_matrix, assignments, len(lowres_grid))
     
-    # Create new AnnData object
     lowres_adata = sc.AnnData(X=aggregated_counts, var=adata.var.copy())
     lowres_adata.obsm['spatial'] = lowres_grid
     
-    # Calculate and store ground truth cell type proportions if cell type information is available
     if cell_type_key is not None and cell_type_key in adata.obs:
         cell_types = adata.obs[cell_type_key].values
         proportions_df = calculate_cell_type_proportions_for_lowres(
@@ -175,10 +163,8 @@ def create_deconvolution_benchmark_data(adata, downsampling_factor=0.25, grid_ty
         lowres_adata.obsm['cell_type_proportions'] = proportions_df.values
         lowres_adata.uns['cell_type_names'] = proportions_df.columns.values
     
-    # Store assignment information
     lowres_adata.uns['spot_assignments'] = assignments
     
-    # Add metadata
     lowres_adata.uns['benchmark_params'] = {
         'original_spots': len(original_coords),
         'low_res_spots': len(lowres_grid),

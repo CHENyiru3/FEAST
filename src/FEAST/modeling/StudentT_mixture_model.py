@@ -1,45 +1,31 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy import stats
 from scipy.stats import t
 from sklearn.mixture import GaussianMixture
-from sklearn.preprocessing import StandardScaler
-import warnings
 from scipy.optimize import fsolve
 
-warnings.filterwarnings('ignore')
-
 def _qqplot_2samples_manual(data1, data2, xlabel, ylabel, line, ax):
-    # 1. Ensure data are numpy arrays
     data1 = np.asarray(data1)
     data2 = np.asarray(data2)
 
-    # 2. Determine the quantiles to plot (from 0.1% to 99.9%)
     n_points = min(len(data1), len(data2))
     percentiles = np.linspace(0.1, 99.9, num=max(100, n_points))
 
-    # 3. Calculate the percentiles (quantiles) for each dataset
     quantiles1 = np.percentile(data1, percentiles)
     quantiles2 = np.percentile(data2, percentiles)
 
-    # 4. Plot the quantiles against each other
     ax.scatter(quantiles1, quantiles2, alpha=0.5, s=15, c='dodgerblue', edgecolor='k', lw=0.5)
 
-    # 5. Plot the reference line (y=x) for perfect agreement
     if line == '45':
         min_val = min(quantiles1.min(), quantiles2.min())
         max_val = max(quantiles1.max(), quantiles2.max())
         ax.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Fit')
 
-    # 6. Set labels and improve aesthetics
     ax.set_xlabel(xlabel, fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
 
 
-# =============================================================================
-# STUDENT'S T MIXTURE MODEL CLASS (Now fully self-contained)
-# =============================================================================
 class StudentTMixtureMarginalModeler:
     """
     Student's T Mixture Model for modeling gene expression parameters.
@@ -99,7 +85,7 @@ class StudentTMixtureMarginalModeler:
                 try:
                     fitted_params = t.fit(component_data)
                     self.model_params['dfs'][i] = max(1.1, fitted_params[0])
-                except:
+                except Exception:
                     self.model_params['dfs'][i] = 10.0
             else:
                 self.model_params['dfs'][i] = 100.0
@@ -165,7 +151,7 @@ class StudentTMixtureMarginalModeler:
                 try:
                     solution = fsolve(equation, x0)[0]
                     result.flat[i] = max(solution, self.data_range[0])
-                except:
+                except Exception:
                     result.flat[i] = np.interp(quantile, [0, 1], self.data_range)
         
         return result.reshape(q.shape)
