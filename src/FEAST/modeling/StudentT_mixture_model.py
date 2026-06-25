@@ -149,8 +149,10 @@ class StudentTMixtureMarginalModeler:
                 def equation(x): return self.cdf(x) - quantile
                 x0 = 10**self.model_params['means'][0] if self.log_transform else self.model_params['means'][0]
                 try:
-                    solution = fsolve(equation, x0)[0]
-                    result.flat[i] = max(solution, self.data_range[0])
+                    solution, infodict, ier, msg = fsolve(equation, x0, maxfev=1000, full_output=True)
+                    if ier != 1:
+                        raise RuntimeError(f"fsolve did not converge: {msg}")
+                    result.flat[i] = max(solution[0], self.data_range[0])
                 except Exception:
                     result.flat[i] = np.interp(quantile, [0, 1], self.data_range)
         
