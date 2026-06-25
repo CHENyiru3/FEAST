@@ -805,6 +805,9 @@ def _finite_sample_correct_zip(pi0, lam, target_stats, n_spots, boundary=None):
             pi0 = min(pi0 + 0.10 * (target_zero - real_zero), 0.99)
         elif real_zero > target_zero:
             pi0 = max(pi0 - 0.10 * (real_zero - target_zero), 0.0)
+    # Guarantee exact mean match: (1-pi0)*lambda = target_mean
+    if target_mean > 1e-10:
+        lam = target_mean / max(1.0 - pi0, 1e-8)
     return pi0, lam
 
 def _estimate_zinb_by_moment_optimization(mu_total, var_total, zero_prop,
@@ -868,6 +871,9 @@ def _finite_sample_correct_zinb(pi0, mu, r, target_stats, n_spots, boundary=None
             pi0 = min(pi0 + 0.10 * (target_zero - real_zero), 0.99)
         elif real_zero > target_zero:
             pi0 = max(pi0 - 0.10 * (real_zero - target_zero), 0.0)
+    # Guarantee exact mean match: (1-pi0)*mu = target_mean
+    if target_mean > 1e-10:
+        mu = target_mean / max(1.0 - pi0, 1e-8)
     return pi0, mu, r
 
 def _select_model_with_heuristic(mu_total, var_total, zero_prop,
