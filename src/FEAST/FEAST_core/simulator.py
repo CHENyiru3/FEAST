@@ -7,7 +7,6 @@ from scipy.spatial.distance import cdist
 
 from .count_decoding import decode_counts_by_rank
 from .parameter_cloud import (
-    STAT_COLUMNS,
     GeneParameterSimulator,
     alteration_config_to_dict,
     calculate_fold_change,
@@ -17,7 +16,7 @@ from .parameter_cloud import (
 
 PARAMETER_MODES = ("hungarian", "reference_stats")
 SPATIAL_MODES = ("reference_rank", "ot_spatial")
-MAX_DENSE_OT_SPOTS = 50_000
+MAX_DENSE_OT_PAIRS = 25_000_000   # ~200 MB as float64; switches to block OT above this
 
 # Internal translation: public parameter_mode ↔ internal simulation_mode
 _PARAMETER_TO_SIMULATION = {"hungarian": "generative", "reference_stats": "empirical"}
@@ -43,7 +42,7 @@ def safe_calculate_qc_metrics(adata, verbose=False):
     try:
         if adata.n_vars > 0 and adata.n_obs > 0:
             sc.pp.calculate_qc_metrics(adata, percent_top=[20, 50, 100] if adata.n_vars > 100 else [50], inplace=True, log1p=False)
-    except (ValueError, TypeError, ImportError) as e:
+    except (ValueError, TypeError, ImportError, IndexError) as e:
         if verbose:
             print(f"Warning: QC calculation failed ({e}), using basic metrics only")
         adata.obs['total_counts'] = np.asarray(adata.X.sum(axis=1)).flatten()
@@ -61,12 +60,26 @@ def _dense_matrix(X, dtype=None):
 
 
 def _gene_stats_from_matrix(matrix, gene_names) -> pd.DataFrame:
-    matrix = np.asarray(matrix, dtype=np.float64)
-    n_obs = matrix.shape[0]
+    from scipy.sparse import issparse
+    if issparse(matrix):
+        means = np.asarray(matrix.mean(axis=0)).ravel()
+        X_sq = matrix.copy()
+        X_sq.data **= 2
+        variances = np.asarray(X_sq.mean(axis=0)).ravel() - means ** 2
+        n_obs = matrix.shape[0]
+        nz = matrix.getnnz(axis=0) if hasattr(matrix, 'getnnz') else np.diff(matrix.tocsc().indptr)
+        zero_prop = 1.0 - nz / n_obs
+        return pd.DataFrame({
+            'mean': means,
+            'variance': variances,
+            'zero_prop': zero_prop,
+        }, index=pd.Index(gene_names, name='gene_id')).clip(lower=1e-10)
+    mat = np.asarray(matrix, dtype=np.float64)
+    n_obs = mat.shape[0]
     return pd.DataFrame({
-        'mean': np.mean(matrix, axis=0),
-        'variance': np.var(matrix, axis=0),
-        'zero_prop': 1 - (np.count_nonzero(matrix, axis=0) / n_obs),
+        'mean': np.mean(mat, axis=0),
+        'variance': np.var(mat, axis=0),
+        'zero_prop': 1 - (np.count_nonzero(mat, axis=0) / n_obs),
     }, index=pd.Index(gene_names, name='gene_id')).clip(lower=1e-10)
 
 
@@ -87,7 +100,7 @@ def _hdf5_safe_metadata(value):
     return value
 
 
-def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_search=True, min_accepted_error=0.5, assignment_weights=None, screening_pool_size=100, top_n_to_fully_evaluate=10, n_jobs=-1, alteration_config=None, simulation_mode='generative', spatial_mode='reference_rank', assignment_method='hybrid', random_seed=None, hybrid_alpha=0.2, use_distributional_alteration=False):
+def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_search=True, min_accepted_error=0.5, assignment_weights=None, screening_pool_size=100, top_n_to_fully_evaluate=10, n_jobs=-1, alteration_config=None, simulation_mode='generative', spatial_mode='reference_rank', assignment_method='hybrid', random_seed=None, hybrid_alpha=0.2, use_distributional_alteration=False, ppf_method='interp', beta_n_jobs=1, beta_early_stopping_patience: int = 2, assignment_solver='scipy', assignment_n_jobs=1, assignment_blocks=True, assignment_block_size=None, assignment_block_multiplier=8, convert_n_jobs=1):
     """
     Build an integrated FEAST gene-parameter table and convert it to count-model parameters.
 
@@ -97,6 +110,12 @@ def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_searc
                               Set to 1.0 for old pure-log-space behavior.
         use_distributional_alteration (bool): If True, alter marginal model parameters (θ → θ')
             before sampling.  If False (default), apply scalar fold-change after sampling (legacy).
+        ppf_method (str): 'interp' (fast, default) or 'exact' (bit-identical fsolve)
+        beta_n_jobs (int): parallel workers for Beta component search (1=sequential)
+        beta_early_stopping_patience (int): patience for Beta mixture early stopping (0 = no early stop)
+        assignment_blocks (bool): use batched Hungarian assignment. Set False for
+            the original full-matrix global Hungarian assignment.
+        convert_n_jobs (int): parallel workers for count-model parameter conversion.
     """
     print("\n>>> Entering STANDARD fitting pipeline: parameter_cloud <<<")
 
@@ -111,7 +130,11 @@ def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_searc
             stacklevel=2,
         )
 
-    simulator = GeneParameterSimulator()
+    simulator = GeneParameterSimulator(
+        ppf_method=ppf_method,
+        beta_n_jobs=beta_n_jobs,
+        beta_early_stopping_patience=beta_early_stopping_patience,
+    )
     simulator.hybrid_alpha = hybrid_alpha
     if mode == 'empirical':
         simulator.fit_statistics_only(adata)
@@ -126,10 +149,15 @@ def run_parameter_cloud_fitting(adata, visualize_fits=False, use_heuristic_searc
         assignment_method=assignment_method,
         verbose=True,
         use_distributional_alteration=use_distributional_alteration,
+        assignment_solver=assignment_solver,
+        assignment_n_jobs=assignment_n_jobs,
+        assignment_blocks=assignment_blocks,
+        assignment_block_size=assignment_block_size,
+        assignment_block_multiplier=assignment_block_multiplier,
     )
 
     model_params = convert_params_for_new_simulator(
-        assigned_synthetic_params, n_spots=adata.n_obs)
+        assigned_synthetic_params, n_spots=adata.n_obs, n_jobs=convert_n_jobs)
     model_params['simulation_evaluation'] = {
         'source': 'integrated_parameter_cloud',
         'simulation_mode': mode,
@@ -255,13 +283,19 @@ class SpatialSimulator:
         self.reference_adata.obs_names_make_unique()
         self._model_params = model_params
 
-    def fit_model(self, visualize_fits: bool = False, use_real_stats_directly: bool = False, use_heuristic_search: bool = False, min_accepted_error: float = 0.5, assignment_weights: dict = None, screening_pool_size: int = 100, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, simulation_mode: str = 'generative', spatial_mode: str = 'reference_rank', assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2, use_distributional_alteration: bool = False) -> 'SpatialSimulator':
+    def fit_model(self, visualize_fits: bool = False, use_real_stats_directly: bool = False, use_heuristic_search: bool = False, min_accepted_error: float = 0.5, assignment_weights: dict = None, screening_pool_size: int = 100, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, simulation_mode: str = 'generative', spatial_mode: str = 'reference_rank', assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2, use_distributional_alteration: bool = False, ppf_method: str = 'interp', beta_n_jobs: int = 1, beta_early_stopping_patience: int = 2, assignment_solver: str = 'scipy', assignment_n_jobs: int = 1, assignment_blocks: bool = True, assignment_block_size: int = None, assignment_block_multiplier: int = 8, convert_n_jobs: int = 1) -> 'SpatialSimulator':
         """
         Exposes heuristic search parameters and marginal distribution alteration.
 
         Args:
             alteration_config (AlterationConfig or dict, optional): Configuration for altering marginal distributions
             use_distributional_alteration (bool): If True, alter marginal model parameters before sampling.
+            ppf_method (str): 'interp' (fast) or 'exact' (bit-identical fsolve)
+            beta_n_jobs (int): parallel workers for Beta component search
+            beta_early_stopping_patience (int): patience for Beta mixture early stopping (0 = no early stop)
+            assignment_blocks (bool): use batched Hungarian assignment. Set False
+                for the original full-matrix global Hungarian assignment.
+            convert_n_jobs (int): parallel workers for count-model conversion.
         """
         adata_for_fitting = self.reference_adata.copy(); safe_calculate_qc_metrics(adata_for_fitting)
         if use_real_stats_directly:
@@ -283,6 +317,15 @@ class SpatialSimulator:
                 random_seed=random_seed,
                 hybrid_alpha=hybrid_alpha,
                 use_distributional_alteration=use_distributional_alteration,
+                ppf_method=ppf_method,
+                beta_n_jobs=beta_n_jobs,
+                beta_early_stopping_patience=beta_early_stopping_patience,
+                assignment_solver=assignment_solver,
+                assignment_n_jobs=assignment_n_jobs,
+                assignment_blocks=assignment_blocks,
+                assignment_block_size=assignment_block_size,
+                assignment_block_multiplier=assignment_block_multiplier,
+                convert_n_jobs=convert_n_jobs,
             )
         return self
     
@@ -331,6 +374,8 @@ class SpatialSimulator:
 
     def _apply_quantile_count_decoding(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, random_seed=None, spatial_mode='reference_rank', target_adata=None):
         """Generate counts from model parameters through rank-based count decoding."""
+        from scipy.sparse import issparse
+        reference_sparse = reference_adata.X if issparse(reference_adata.X) else None
         reference_matrix = _dense_matrix(reference_adata.X, dtype=np.float64)
         n_spots, n_genes = reference_matrix.shape
 
@@ -353,13 +398,17 @@ class SpatialSimulator:
 
             source_coords = reference_adata.obsm['spatial']
 
-            if n_spots > MAX_DENSE_OT_SPOTS or n_target > MAX_DENSE_OT_SPOTS:
-                # Use block OT for large datasets
+            # Per-gene max from sparse for boundary / clipping (much cheaper than dense)
+            if reference_sparse is not None and len(common_genes) < n_genes:
+                clip_ref = reference_sparse[:, reference_adata.var_names.get_indexer(common_genes)]
+            else:
+                clip_ref = reference_sparse if reference_sparse is not None else reference_matrix
+
+            if n_spots * n_target > MAX_DENSE_OT_PAIRS:
                 transported = _block_ot_transport(
                     reference_matrix, source_coords, target_coords, reg=0.05
                 )
                 spatial_coords = target_coords.copy()
-                reference_for_clip = reference_matrix
                 n_spots = n_target
                 quantile_input = transported
             else:
@@ -372,21 +421,16 @@ class SpatialSimulator:
 
                 plan = sinkhorn_transport(M=cost, a=a, b=b, reg=0.05)
 
-                # Convert reference counts to rank quantiles per gene — puts all genes
-                # on [0,1] scale so transport is unbiased by expression magnitude.
                 ref_quantiles = midpoint_rank_normalize(
                     reference_matrix,
                     tie_policy='stable_ordinal',
                     clip_eps=1e-6,
                 )
 
-                # Column-normalize the plan and transport RANK QUANTILES (not raw counts).
                 col_mass = plan.sum(axis=0, keepdims=True)
                 safe_mass = np.where(col_mass > 1e-12, col_mass, 1.0)
                 transported = (plan / safe_mass).T @ ref_quantiles
 
-                # Rank-normalize transported scores back to [0,1] — fixes
-                # variance compression from the OT weighted average.
                 transported = midpoint_rank_normalize(
                     transported,
                     tie_policy='stable_ordinal',
@@ -394,25 +438,28 @@ class SpatialSimulator:
                 )
 
                 spatial_coords = target_coords.copy()
-                reference_for_clip = reference_matrix
                 n_spots = n_target
                 quantile_input = transported
         else:
             spatial_coords = reference_adata.obsm['spatial']
-            reference_for_clip = reference_matrix
+            clip_ref = reference_sparse if reference_sparse is not None else reference_matrix
             quantile_input = reference_matrix
 
         simulated_matrix = decode_counts_by_rank(
             quantile_input,
             model_params,
             boundary_multiplier=boundary_multiplier,
-            reference_X=reference_for_clip,
+            reference_X=clip_ref,
             random_seed=seed,
         ).astype(np.float32, copy=False)
 
         boundary_clipped_gene_count = 0
         if clip_overshoot_factor > 0:
-            max_ref_counts = np.max(reference_for_clip, axis=0)
+            from scipy.sparse import issparse
+            if issparse(clip_ref):
+                max_ref_counts = np.asarray(clip_ref.max(axis=0).toarray()).ravel()
+            else:
+                max_ref_counts = np.max(clip_ref, axis=0)
             clip_max = max_ref_counts * (1 + clip_overshoot_factor)
             before = simulated_matrix.copy()
             simulated_matrix = np.clip(simulated_matrix, 0, clip_max)
@@ -516,6 +563,15 @@ class SpatialSimulator:
             "random_seed": kwargs.get("random_seed"),
             "hybrid_alpha": kwargs.get("hybrid_alpha", 0.2),
             "use_distributional_alteration": kwargs.get("use_distributional_alteration", False),
+            "ppf_method": kwargs.get("ppf_method", "interp"),
+            "beta_n_jobs": kwargs.get("beta_n_jobs", 1),
+            "beta_early_stopping_patience": kwargs.get("beta_early_stopping_patience", 2),
+            "assignment_solver": kwargs.get("assignment_solver", "scipy"),
+            "assignment_n_jobs": kwargs.get("assignment_n_jobs", 1),
+            "assignment_blocks": kwargs.get("assignment_blocks", True),
+            "assignment_block_size": kwargs.get("assignment_block_size"),
+            "assignment_block_multiplier": kwargs.get("assignment_block_multiplier", 8),
+            "convert_n_jobs": kwargs.get("convert_n_jobs", 1),
         }
         self.fit_model(**fit_kwargs)
         simulated = self.simulate(
@@ -597,8 +653,10 @@ def _block_ot_transport(reference_matrix, source_coords, target_coords, reg=0.05
     uncovered = count_accum == 0
     if np.any(uncovered):
         uncovered_idx = np.where(uncovered)[0]
-        dist_all = cdist(target_coords[uncovered_idx], source_coords, metric='euclidean')
-        nearest_src = np.argmin(dist_all, axis=1)
+        from sklearn.neighbors import NearestNeighbors
+        nn = NearestNeighbors(n_neighbors=1, metric='euclidean')
+        nn.fit(source_coords)
+        nearest_src = nn.kneighbors(target_coords[uncovered_idx], return_distance=False).ravel()
         transported_accum[uncovered_idx, :] = ref_quantiles[nearest_src, :]
         count_accum[uncovered_idx] = 1.0
 
@@ -608,7 +666,7 @@ def _block_ot_transport(reference_matrix, source_coords, target_coords, reg=0.05
     return transported
 
 
-def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, parameter_mode: str = 'hungarian', spatial_mode: str = 'reference_rank', target_adata=None, assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2, use_distributional_alteration: bool = False) -> ad.AnnData:
+def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, parameter_mode: str = 'hungarian', spatial_mode: str = 'reference_rank', target_adata=None, assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2, use_distributional_alteration: bool = False, ppf_method: str = 'interp', beta_n_jobs: int = 1, beta_early_stopping_patience: int = 2, assignment_solver: str = 'scipy', assignment_n_jobs: int = 1, assignment_blocks: bool = True, assignment_block_size: int = None, assignment_block_multiplier: int = 8, convert_n_jobs: int = 1) -> ad.AnnData:
     """
     Run single-slice simulation.
 
@@ -621,6 +679,12 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
         assignment_method: 'hybrid' or 'copula_rank' — only meaningful when parameter_mode='hungarian'.
         random_seed: Optional seed for reproducible generative sampling.
         use_distributional_alteration: If True, alter marginal model parameters (θ → θ').
+        ppf_method: 'interp' (fast, default) or 'exact' (bit-identical fsolve).
+        beta_n_jobs: parallel workers for Beta component search (1=sequential).
+        beta_early_stopping_patience: patience for Beta mixture early stopping (0 = no early stop).
+        assignment_blocks: use batched Hungarian (True, default) or full global (False).
+        assignment_block_multiplier: candidates per gene in each batch (default 8).
+        convert_n_jobs: parallel workers for count-model parameter conversion (1=sequential).
     """
     simulation_mode = _translate_parameter_mode(parameter_mode)
     spatial_mode = _translate_spatial_mode(spatial_mode)
@@ -652,6 +716,15 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
         'random_seed': random_seed,
         'hybrid_alpha': hybrid_alpha,
         'use_distributional_alteration': use_distributional_alteration,
+        'ppf_method': ppf_method,
+        'beta_n_jobs': beta_n_jobs,
+        'beta_early_stopping_patience': beta_early_stopping_patience,
+        'assignment_solver': assignment_solver,
+        'assignment_n_jobs': assignment_n_jobs,
+        'assignment_blocks': assignment_blocks,
+        'assignment_block_size': assignment_block_size,
+        'assignment_block_multiplier': assignment_block_multiplier,
+        'convert_n_jobs': convert_n_jobs,
     }
 
     if annotation_key:

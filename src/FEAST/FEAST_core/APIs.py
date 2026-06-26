@@ -64,6 +64,16 @@ class FEAST:
         assignment_method: str = "hybrid",
         random_seed: Optional[int] = None,
         target_adata=None,
+        hybrid_alpha: float = 0.2,
+        use_distributional_alteration: bool = False,
+        ppf_method: str = "interp",
+        beta_n_jobs: int = 1,
+        beta_early_stopping_patience: int = 2,
+        assignment_solver: str = "scipy",
+        assignment_blocks: bool = True,
+        assignment_block_size: Optional[int] = None,
+        assignment_block_multiplier: int = 8,
+        convert_n_jobs: int = 1,
     ) -> ad.AnnData:
         if verbose is None:
             verbose = self.verbose
@@ -88,6 +98,16 @@ class FEAST:
             target_adata=target_adata,
             assignment_method=assignment_method,
             random_seed=random_seed,
+            hybrid_alpha=hybrid_alpha,
+            use_distributional_alteration=use_distributional_alteration,
+            ppf_method=ppf_method,
+            beta_n_jobs=beta_n_jobs,
+            beta_early_stopping_patience=beta_early_stopping_patience,
+            assignment_solver=assignment_solver,
+            assignment_blocks=assignment_blocks,
+            assignment_block_size=assignment_block_size,
+            assignment_block_multiplier=assignment_block_multiplier,
+            convert_n_jobs=convert_n_jobs,
         )
 
     def simulate_alignment(
