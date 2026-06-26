@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from scipy.special import betaln, digamma
 from scipy.stats import beta
 from scipy.optimize import minimize
 from sklearn.cluster import KMeans
@@ -107,9 +108,12 @@ def fit_beta_mixture_em(data, n_components=2, max_iter=200, tol=1e-6):
         # E-step: Calculate responsibilities
         responsibilities = np.zeros((n_samples, n_components))
         component_logpdfs = np.zeros((n_samples, n_components))
-        
+
+        log_weights = np.full(n_components, -np.inf, dtype=np.float64)
+        positive_weight = weights > 0
+        log_weights[positive_weight] = np.log(weights[positive_weight])
         for k in range(n_components):
-            component_logpdfs[:, k] = np.log(weights[k]) + _beta_logpdf(data, alphas[k], betas[k])
+            component_logpdfs[:, k] = log_weights[k] + _beta_logpdf(data, alphas[k], betas[k])
         
         # Numerical stability
         max_log = np.max(component_logpdfs, axis=1, keepdims=True)
@@ -123,23 +127,45 @@ def fit_beta_mixture_em(data, n_components=2, max_iter=200, tol=1e-6):
         
         # M-step: Update parameters
         weights = np.mean(responsibilities, axis=0)
-        
+
+        # Pre-compute once per EM iteration
+        log_x = np.log(np.clip(data, 1e-15, 1 - 1e-15))
+        log_1mx = np.log(np.clip(1 - data, 1e-15, 1 - 1e-15))
+
         for k in range(n_components):
-            # Weighted MLE for Beta parameters using optimization
+            resp_k = responsibilities[:, k]
+            w_sum = float(np.sum(resp_k))
+            if w_sum < 1e-10:
+                continue
+
+            # Analytical gradient for Beta negative log-likelihood
+            s1 = float(np.sum(resp_k * log_x) / w_sum)
+            s2 = float(np.sum(resp_k * log_1mx) / w_sum)
+
             def objective(params):
-                alpha, beta_param = params
-                if alpha <= 0 or beta_param <= 0:
+                a, b = float(params[0]), float(params[1])
+                if a <= 0.005 or b <= 0.005 or a > 200 or b > 200:
                     return np.inf
-                logpdf_vals = _beta_logpdf(data, alpha, beta_param)
-                return -np.sum(responsibilities[:, k] * logpdf_vals)
-            
+                # -log L = W * [betaln(a,b) - (a-1)*s1 - (b-1)*s2]
+                return w_sum * (betaln(a, b) - (a - 1) * s1 - (b - 1) * s2)
+
+            def gradient(params):
+                a, b = float(params[0]), float(params[1])
+                psi_ab = digamma(a + b)
+                # d/da: W * [psi(a) - psi(a+b) - s1]
+                g_a = w_sum * (digamma(a) - psi_ab - s1)
+                # d/db: W * [psi(b) - psi(a+b) - s2]
+                g_b = w_sum * (digamma(b) - psi_ab - s2)
+                return np.array([g_a, g_b], dtype=np.float64)
+
             result = minimize(
                 objective,
-                x0=[alphas[k], betas[k]],
-                bounds=[(0.01, 100), (0.01, 100)],
-                method='L-BFGS-B'
+                x0=[float(alphas[k]), float(betas[k])],
+                jac=gradient,
+                bounds=[(0.01, 200), (0.01, 200)],
+                method='L-BFGS-B',
+                options={'maxiter': 200, 'ftol': 1e-12},
             )
-            
             if result.success:
                 alphas[k], betas[k] = result.x
         
@@ -175,92 +201,143 @@ class BetaMixtureMarginalModeler:
         self.best_n_components = None
         self.model_selection_scores = None
     
-    def fit(self, data, visualize=True, selection_criterion='bic'):
-        """
-        Fit Beta mixture model to data with automatic component selection.
-        
+    def fit(self, data, visualize=True, selection_criterion='bic',
+            early_stopping_patience: int = 2, n_jobs: int = 1):
+        """Fit Beta mixture model to data with automatic component selection.
+
         Args:
-            data: Input data (pandas Series or numpy array) - should be proportions in [0, 1]
-            log_transform: Ignored for Beta distribution (always False)
+            data: Input data (pandas Series or numpy array) — proportions in [0, 1]
             visualize: Whether to show fit visualization (default: True)
             selection_criterion: 'bic' or 'aic' for model selection (default: 'bic')
+            early_stopping_patience: stop trying more components if the criterion
+                has not improved for this many consecutive steps (0 = no early stop).
+                Ignored when n_jobs > 1 (all components computed in parallel).
+            n_jobs: Number of parallel workers for component search (1 = sequential).
         """
-        self.log_transform = False  # Beta distribution works with original proportions
-        
-        # Preprocess data
+        self.log_transform = False
+
         if hasattr(data, 'values'):
             data_array = data.values
         else:
             data_array = np.array(data)
-        
-        # Ensure data is in [0, 1] and handle edge cases
+
         processed_data = np.clip(data_array, 1e-10, 1 - 1e-10)
-        
-        # Remove invalid values
         processed_data = processed_data[np.isfinite(processed_data)]
-        
+
         if len(processed_data) == 0:
             raise ValueError("No valid data points after preprocessing.")
-        
-        # Model selection across different numbers of components
-        n_components_range = range(1, self.max_components + 1)
-        scores = []
-        models = []
-        log_likelihoods = []
-        
-        print(f"Fitting Beta mixture models with 1-{self.max_components} components...")
-        
-        for n in n_components_range:
-            if n == 1:
-                # Single Beta distribution
-                params = fit_single_beta(processed_data)
-                model_params = {
-                    'weights': np.array([1.0]),
-                    'alphas': np.array([params['alpha']]),
-                    'betas': np.array([params['beta']]),
-                    'n_params': 2
-                }
-                
-                # Calculate log-likelihood
-                log_lik = np.sum(_beta_logpdf(processed_data, params['alpha'], params['beta']))
-            else:
-                # Multiple component mixture
-                model_params, log_lik = fit_beta_mixture_em(processed_data, n_components=n)
-            
-            models.append(model_params)
-            log_likelihoods.append(log_lik)
-            
-            # Calculate selection criterion
-            if selection_criterion == 'bic':
-                score = calculate_bic_beta(log_lik, model_params['n_params'], len(processed_data))
-            else:  # aic
-                score = calculate_aic_beta(log_lik, model_params['n_params'])
-            
-            scores.append(score)
-            print(f"  {n} components: {selection_criterion.upper()}={score:.2f}, LogLik={log_lik:.2f}")
-        
-        # Select best model
-        best_idx = np.argmin(scores)
-        self.best_n_components = n_components_range[best_idx]
+
+        max_n = self.max_components
+        n_samples = len(processed_data)
+
+        if n_jobs > 1:
+            # --- Parallel path: compute n=1..max_n in parallel ---
+            from joblib import Parallel, delayed
+
+            def _fit_one(n):
+                if n == 1:
+                    params = fit_single_beta(processed_data)
+                    mp = {
+                        'weights': np.array([1.0]),
+                        'alphas': np.array([params['alpha']]),
+                        'betas': np.array([params['beta']]),
+                        'n_params': 2,
+                    }
+                    ll = np.sum(_beta_logpdf(processed_data, params['alpha'], params['beta']))
+                else:
+                    mp, ll = fit_beta_mixture_em(processed_data, n_components=n)
+                if selection_criterion == 'bic':
+                    sc = calculate_bic_beta(ll, mp['n_params'], n_samples)
+                else:
+                    sc = calculate_aic_beta(ll, mp['n_params'])
+                return n, mp, ll, sc
+
+            print(f"Fitting Beta mixture models with 1-{max_n} components"
+                  f" (n_jobs={n_jobs})...")
+            results = Parallel(n_jobs=n_jobs, prefer='threads')(
+                delayed(_fit_one)(n) for n in range(1, max_n + 1)
+            )
+            results.sort(key=lambda x: x[0])  # ensure component order
+
+            models = [r[1] for r in results]
+            log_likelihoods = [r[2] for r in results]
+            scores = [r[3] for r in results]
+
+            best_idx = np.argmin(scores)
+            for n, _, ll, sc in results:
+                flag = " *" if sc == scores[best_idx] else ""
+                print(f"  {n} components: {selection_criterion.upper()}={sc:.2f}, "
+                      f"LogLik={ll:.2f}{flag}")
+        else:
+            # --- Sequential path (original) ---
+            n_components_range = range(1, max_n + 1)
+            scores = []
+            models = []
+            log_likelihoods = []
+            best_score = np.inf
+            steps_since_best = 0
+
+            print(f"Fitting Beta mixture models with 1-{max_n} components"
+                  f" (early_stop patience={early_stopping_patience})...")
+
+            for n in n_components_range:
+                if n == 1:
+                    params = fit_single_beta(processed_data)
+                    model_params = {
+                        'weights': np.array([1.0]),
+                        'alphas': np.array([params['alpha']]),
+                        'betas': np.array([params['beta']]),
+                        'n_params': 2,
+                    }
+                    log_lik = np.sum(_beta_logpdf(processed_data, params['alpha'], params['beta']))
+                else:
+                    model_params, log_lik = fit_beta_mixture_em(processed_data, n_components=n)
+
+                models.append(model_params)
+                log_likelihoods.append(log_lik)
+
+                if selection_criterion == 'bic':
+                    score = calculate_bic_beta(log_lik, model_params['n_params'], len(processed_data))
+                else:
+                    score = calculate_aic_beta(log_lik, model_params['n_params'])
+
+                scores.append(score)
+                improved = score < best_score - 0.01
+                flag = " *" if improved else ""
+                print(f"  {n} components: {selection_criterion.upper()}={score:.2f}, LogLik={log_lik:.2f}{flag}")
+                if improved:
+                    best_score = score
+                    steps_since_best = 0
+                else:
+                    steps_since_best += 1
+
+                if early_stopping_patience > 0 and steps_since_best >= early_stopping_patience:
+                    print(f"  Early stopping at {n} components "
+                          f"(no improvement for {steps_since_best} steps).")
+                    break
+
+            best_idx = np.argmin(scores)
+        self.best_n_components = best_idx + 1  # 0-indexed → component count
         self.model_params = models[best_idx]
         self.model_selection_scores = {
-            'n_components': list(n_components_range),
+            'n_components': list(range(1, len(scores) + 1)),
             'scores': scores,
             'log_likelihoods': log_likelihoods,
             'best_idx': best_idx,
-            'criterion': selection_criterion
+            'criterion': selection_criterion,
         }
-        
+
         if self.model_params is None:
             raise RuntimeError("All model fitting attempts failed.")
-        
+
         self._is_fitted = True
-        
-        print(f"✓ Best model: {self.best_n_components} components ({selection_criterion.upper()}={scores[best_idx]:.2f})")
-        
+
+        print(f"✓ Best model: {self.best_n_components} components "
+              f"({selection_criterion.upper()}={scores[best_idx]:.2f})")
+
         if visualize:
             self._visualize_fit(data, getattr(data, 'name', 'Data'))
-        
+
         return self
     
     def sample(self, n):
@@ -406,4 +483,3 @@ class BetaMixtureMarginalModeler:
             mean = alpha / (alpha + beta_param)
             print(f"  Component {i+1}: weight={weight:.3f}, "
                   f"α={alpha:.3f}, β={beta_param:.3f}, mean={mean:.3f}")
-

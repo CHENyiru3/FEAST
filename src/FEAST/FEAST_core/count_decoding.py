@@ -1,6 +1,7 @@
 """Rank-based count decoding for FEAST simulation.
 
-Single pipeline: generate_count_bag_from_model_params() -> np.sort() -> assign by argsort(quantiles).
+Single pipeline: sample per gene → sort → assign by argsort(quantiles).
+Streaming decode avoids materialising the full raw_counts intermediate.
 """
 
 from __future__ import annotations
@@ -19,6 +20,14 @@ def _dense_array(X, dtype=None) -> Optional[np.ndarray]:
     if dtype is not None:
         arr = arr.astype(dtype, copy=False)
     return arr
+
+
+def _sparse_per_gene_max(X, n_genes: int) -> np.ndarray:
+    """Compute per-gene maximum from a potentially sparse matrix."""
+    from scipy.sparse import issparse
+    if issparse(X):
+        return np.asarray(X.max(axis=0).toarray()).ravel()
+    return np.max(np.asarray(X, dtype=np.float64), axis=0).reshape(-1)
 
 
 def _model_type_and_params(model_params: dict, gene_idx: int):
@@ -41,9 +50,8 @@ def _boundary_per_gene(
     boundary_multiplier: float,
 ) -> np.ndarray:
     boundary = np.full(n_genes, np.inf, dtype=np.float64)
-    reference = _dense_array(reference_X, dtype=np.float64)
-    if reference is not None and reference.size:
-        boundary = np.max(reference, axis=0).reshape(-1).astype(np.float64) * float(boundary_multiplier)
+    if reference_X is not None and (hasattr(reference_X, 'shape') and reference_X.shape[0] > 0):
+        boundary = _sparse_per_gene_max(reference_X, n_genes) * float(boundary_multiplier)
         if boundary.shape[0] != n_genes:
             boundary = np.resize(boundary, n_genes).astype(np.float64)
 
@@ -80,7 +88,11 @@ def generate_count_bag_from_model_params(
     reference_X=None,
     random_seed: Optional[int] = None,
 ) -> np.ndarray:
-    """Sample an unordered per-gene count bag from fitted FEAST model params."""
+    """Sample an unordered per-gene count bag from fitted FEAST model params.
+
+    For large datasets, prefer decode_counts_by_rank() directly — it streams
+    per gene and avoids allocating this full intermediate matrix.
+    """
     if "model_selected" not in model_params or "marginal_param1" not in model_params:
         raise ValueError("model_params must contain 'model_selected' and 'marginal_param1'.")
 
@@ -112,11 +124,14 @@ def decode_counts_by_rank(
 ) -> np.ndarray:
     """Decode counts from rank-ordered quantile positions.
 
-    For each gene:
-      1. Stochastically sample a count bag from the fitted model params.
-      2. Sort the bag.
-      3. Assign to spots by argsort(quantiles[:, gene]).
+    For each gene, samples a count bag, sorts, and assigns to spots by
+    argsort(quantiles[:, gene]) — then discards the bag before moving to
+    the next gene.  Avoids the full (n_spots × n_genes) raw_counts
+    intermediate that would double peak memory for large datasets.
     """
+    if "model_selected" not in model_params or "marginal_param1" not in model_params:
+        raise ValueError("model_params must contain 'model_selected' and 'marginal_param1'.")
+
     quantiles = np.asarray(quantiles, dtype=np.float64)
     if quantiles.ndim != 2:
         raise ValueError("quantiles must be a 2D array.")
@@ -125,15 +140,8 @@ def decode_counts_by_rank(
     if n_spots == 0:
         return np.zeros((0, n_genes), dtype=np.int32)
 
-    raw_counts = generate_count_bag_from_model_params(
-        model_params,
-        n_spots,
-        boundary_multiplier=boundary_multiplier,
-        reference_X=reference_X,
-        random_seed=random_seed,
-    )
-
-    final_counts = np.zeros((n_spots, n_genes), dtype=np.float32)
+    rng = np.random if random_seed is None else np.random.default_rng(int(random_seed))
+    boundary = _boundary_per_gene(reference_X, n_genes, model_params, boundary_multiplier)
 
     if spot_weights is not None:
         weights = np.asarray(spot_weights, dtype=np.float64).reshape(-1)
@@ -145,6 +153,7 @@ def decode_counts_by_rank(
         weights = None
 
     q_positions = np.linspace(0.0, 1.0, n_spots, dtype=np.float64)
+    final_counts = np.zeros((n_spots, n_genes), dtype=np.float32)
 
     iterator = range(n_genes)
     if show_progress:
@@ -153,17 +162,23 @@ def decode_counts_by_rank(
         iterator = tqdm(iterator)
 
     for gene_idx in iterator:
-        gene_counts_bag = np.sort(raw_counts[:, gene_idx])
+        model_type, pi0, r, mu = _model_type_and_params(model_params, gene_idx)
+        gene_bag = _sample_gene_counts(model_type, pi0, r, mu, n_spots, rng).astype(np.float32)
+        gene_boundary = boundary[gene_idx]
+        if np.isfinite(gene_boundary):
+            gene_bag = np.minimum(gene_bag, gene_boundary)
+        gene_bag.sort()
+
         spot_rank_order = np.argsort(quantiles[:, gene_idx])
         if weights is None:
-            final_counts[spot_rank_order, gene_idx] = gene_counts_bag
+            final_counts[spot_rank_order, gene_idx] = gene_bag
         else:
             w_ordered = weights[spot_rank_order]
             cum_w = np.cumsum(w_ordered)
             if cum_w[-1] <= 0:
-                final_counts[spot_rank_order, gene_idx] = gene_counts_bag
+                final_counts[spot_rank_order, gene_idx] = gene_bag
             else:
                 q_w = (cum_w - 0.5 * w_ordered) / cum_w[-1]
-                final_counts[spot_rank_order, gene_idx] = np.interp(q_w, q_positions, gene_counts_bag)
+                final_counts[spot_rank_order, gene_idx] = np.interp(q_w, q_positions, gene_bag)
 
     return np.rint(final_counts).astype(np.int32)
