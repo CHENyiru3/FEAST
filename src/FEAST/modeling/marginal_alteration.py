@@ -76,6 +76,8 @@ class MarginalModelAlterator:
 
         if hasattr(target_modeler, '_ppf_cache'):
             target_modeler._ppf_cache.clear()
+        if hasattr(target_modeler, '_ppf_interp'):
+            delattr(target_modeler, '_ppf_interp')
         
         # Verify results
         if verbose:

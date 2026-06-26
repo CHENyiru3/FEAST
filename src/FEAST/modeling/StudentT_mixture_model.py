@@ -196,7 +196,7 @@ class StudentTMixtureMarginalModeler:
                 self._build_ppf_interpolator()
             q_clipped = np.clip(q, 1e-10, 1.0 - 1e-10)
             out = self._ppf_interp(q_clipped)
-            out = np.clip(out, self.data_range[0], self.data_range[1])
+            out = np.maximum(out, self.data_range[0])
             return out
 
         # exact: scalar fsolve per quantile
