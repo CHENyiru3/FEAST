@@ -85,6 +85,9 @@ example_data/
 results/
 outputs/
 
+# Documentation build artifacts
+docs/_build/
+
 # Non-core directories
 benchmark_scripts/
 reproduction/
