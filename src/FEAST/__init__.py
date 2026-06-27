@@ -5,7 +5,7 @@ from __future__ import annotations
 from importlib import import_module as _import_module
 from importlib.util import find_spec as _find_spec
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 from .FEAST_core.APIs import FEAST
 from .FEAST_core import simulator
