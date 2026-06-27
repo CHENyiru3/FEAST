@@ -540,6 +540,31 @@ def _to_dense_matrix(matrix) -> np.ndarray:
     return np.asarray(matrix, dtype=np.float32)
 
 
+def _sparse_gene_stats(matrix, gene_names) -> "pd.DataFrame":
+    """Compute per-gene mean, variance, zero_prop from a sparse matrix."""
+    from scipy.sparse import issparse
+    import pandas as pd
+    if issparse(matrix):
+        means = np.asarray(matrix.mean(axis=0)).ravel()
+        X_sq = matrix.copy()
+        X_sq.data **= 2
+        variances = np.asarray(X_sq.mean(axis=0)).ravel() - means ** 2
+        n_obs = matrix.shape[0]
+        nz = matrix.getnnz(axis=0) if hasattr(matrix, 'getnnz') else np.diff(matrix.tocsc().indptr)
+        zero_prop = 1.0 - nz / n_obs
+        out = pd.DataFrame(index=list(map(str, gene_names)))
+        out["mean"] = np.clip(means, 1e-8, None)
+        out["variance"] = np.clip(variances, 1e-8, None)
+        out["zero_prop"] = np.clip(zero_prop, 0.0, 0.99)
+        return out
+    mat = np.asarray(matrix, dtype=np.float64)
+    out = pd.DataFrame(index=list(map(str, gene_names)))
+    out["mean"] = np.clip(mat.mean(axis=0), 1e-8, None)
+    out["variance"] = np.clip(mat.var(axis=0), 1e-8, None)
+    out["zero_prop"] = np.clip(np.mean(mat <= 0, axis=0), 0.0, 0.99)
+    return out
+
+
 def _counts_matrix(adata: ad.AnnData) -> np.ndarray:
     if "counts" in adata.layers:
         return _to_dense_matrix(adata.layers["counts"])

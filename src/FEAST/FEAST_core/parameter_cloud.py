@@ -19,6 +19,36 @@ from ..modeling.marginal_alteration import alter_marginal_model, AlterationConfi
 STAT_COLUMNS = ['mean', 'variance', 'zero_prop']
 SIMULATION_MODES = ('generative', 'empirical')
 
+
+def _solve_assignment(cost_matrix: np.ndarray, assignment_solver: str = 'scipy'):
+    """Solve rectangular linear assignment problem.
+
+    Parameters
+    ----------
+    cost_matrix : (n_rows, n_cols) ndarray, n_rows <= n_cols
+    assignment_solver : 'scipy' or 'lapjv'
+
+    Returns
+    -------
+    row_ind, col_ind : indices of optimal assignment
+    """
+    if assignment_solver == 'lapjv':
+        try:
+            import lap
+            n_rows = cost_matrix.shape[0]
+            # lapjv with extend_cost=True pads to square; x[i] = column
+            # assigned to row i.  Only original rows 0..n_rows-1 are real.
+            _, x, _ = lap.lapjv(cost_matrix.astype(np.float64), extend_cost=True)
+            col_ind = np.asarray(x[:n_rows], dtype=np.intp)
+            valid = col_ind >= 0
+            row_ind = np.arange(n_rows, dtype=np.intp)[valid]
+            col_ind = col_ind[valid]
+            return row_ind, col_ind
+        except ImportError:
+            warnings.warn("lap package not installed, falling back to scipy solver.")
+    # Default: scipy (modified Jonker-Volgenant)
+    return linear_sum_assignment(cost_matrix)
+
 def to_uniform(series):
     return rankdata(series, method='ordinal') / (len(series) + 1)
 
@@ -234,14 +264,23 @@ def _assignment_weight_vector(weights=None) -> np.ndarray:
     return np.array([defaults['mean'], defaults['variance'], defaults['zero_prop']], dtype=float)
 
 class GeneParameterSimulator:
-    def __init__(self):
+    def __init__(self, max_zero_prop_components: int = 8,
+                 beta_early_stopping_patience: int = 2,
+                 beta_n_jobs: int = 1,
+                 ppf_method: str = 'interp'):
         self.param_models = {
-            'mean': StudentTMixtureMarginalModeler(max_components=15), 
-            'variance': StudentTMixtureMarginalModeler(max_components=15), 
-            'zero_prop': BetaMixtureMarginalModeler(max_components=8)
+            'mean': StudentTMixtureMarginalModeler(max_components=15,
+                                                    ppf_method=ppf_method),
+            'variance': StudentTMixtureMarginalModeler(max_components=15,
+                                                        ppf_method=ppf_method),
+            'zero_prop': BetaMixtureMarginalModeler(
+                max_components=max_zero_prop_components),
         }
+        self._beta_early_stopping_patience = beta_early_stopping_patience
+        self._beta_n_jobs = beta_n_jobs
+        self._ppf_method = ppf_method
         print("✓ Using optimal models: Student's T for mean, Student's T for variance, Beta for zero_prop.")
-        
+
         self.fitted = False
         self.copula_model, self.original_stats, self.target_stats, self.dependency_modeler, self.n_obs = (
             None,
@@ -254,12 +293,27 @@ class GeneParameterSimulator:
     def fit_statistics_only(self, adata):
         print("\n--- [FITTING STATS ONLY] Calculating original gene statistics ---")
         self.n_obs = adata.n_obs
-        X = adata.X.toarray() if hasattr(adata.X, 'toarray') else adata.X.copy()
-        self.original_stats = pd.DataFrame({
-            'mean': np.mean(X, axis=0), 
-            'variance': np.var(X, axis=0), 
-            'zero_prop': 1 - (np.count_nonzero(X, axis=0) / self.n_obs)
-        }, index=adata.var_names).clip(lower=1e-10)
+        from scipy.sparse import issparse
+        X = adata.X
+        if issparse(X):
+            means = np.asarray(X.mean(axis=0)).ravel()
+            X_sq = X.copy()
+            X_sq.data **= 2
+            variances = np.asarray(X_sq.mean(axis=0)).ravel() - means ** 2
+            nz = X.getnnz(axis=0) if hasattr(X, 'getnnz') else np.diff(X.tocsc().indptr)
+            zero_prop = 1.0 - nz / self.n_obs
+            self.original_stats = pd.DataFrame({
+                'mean': means,
+                'variance': variances,
+                'zero_prop': zero_prop,
+            }, index=adata.var_names).clip(lower=1e-10)
+        else:
+            Xd = np.asarray(X, dtype=np.float64)
+            self.original_stats = pd.DataFrame({
+                'mean': np.mean(Xd, axis=0),
+                'variance': np.var(Xd, axis=0),
+                'zero_prop': 1 - (np.count_nonzero(Xd, axis=0) / self.n_obs),
+            }, index=adata.var_names).clip(lower=1e-10)
         self.target_stats = self.original_stats.copy()
         print("✓ Statistics calculated.")
         return self
@@ -275,8 +329,13 @@ class GeneParameterSimulator:
                 # Student's T models accept log_transform
                 modeler.fit(self.original_stats[param], log_transform=(param != 'zero_prop'), visualize=visualize_fits)
             else:
-                # Beta models and others don't accept log_transform
-                modeler.fit(self.original_stats[param], visualize=visualize_fits)
+                # Beta model: pass early_stopping_patience
+                fit_kw = {'visualize': visualize_fits}
+                if param == 'zero_prop':
+                    fit_kw['early_stopping_patience'] = getattr(
+                        self, '_beta_early_stopping_patience', 2)
+                    fit_kw['n_jobs'] = getattr(self, '_beta_n_jobs', 1)
+                modeler.fit(self.original_stats[param], **fit_kw)
         self.copula_model = self.dependency_modeler.fit_copula_model(self.original_stats)
         self.fitted = True
         print("\n✓ Simulator has been successfully fitted to the data.")
@@ -309,43 +368,162 @@ class GeneParameterSimulator:
             return final_params, uniform_samples
         return final_params
 
-    def assign_to_genes(self, synthetic_df, weights={'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0}, random_seed=42, verbose=True, hybrid_alpha=0.2):
+    def assign_to_genes(
+        self,
+        synthetic_df,
+        weights={'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0},
+        random_seed=42,
+        verbose=True,
+        hybrid_alpha=0.2,
+        assignment_solver='scipy',
+        n_jobs: int = 1,
+        assignment_blocks: bool = True,
+        assignment_block_size: Optional[int] = None,
+        assignment_block_multiplier: int = 8,
+    ):
         """Assign synthetic profiles to genes via optimal transport.
 
         Uses a hybrid cost with 20% log-space distance and 80% raw z-score distance.
         hybrid_alpha controls the log-space weight; 0.2 = 20% log, 80% raw (production default).
-        hybrid_alpha=1.0 recovers the old pure log-space cost.
-        """
-        if verbose: print(f"\n--- [ASSIGNING] Assigning synthetic profiles (seed: {random_seed}, hybrid_alpha={hybrid_alpha})...")
-        assignment_stats = self._assignment_stats()
-        if len(synthetic_df) < len(assignment_stats): raise ValueError("Fewer synthetic profiles than real genes. Increase overgeneration_factor.")
 
-        # Use ALL overgenerated candidates — do not subsample before OT
+        assignment_blocks=True uses batched Hungarian assignment to reduce peak memory.
+        assignment_blocks=False recovers the original full-matrix global assignment.
+        """
+        if n_jobs > 1:
+            warnings.warn(
+                "n_jobs > 1 is not currently used for assignment; "
+                "assignment runs sequentially regardless of this setting.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if verbose:
+            print(
+                f"\n--- [ASSIGNING] Assigning synthetic profiles "
+                f"(seed: {random_seed}, hybrid_alpha={hybrid_alpha}, "
+                f"blocks={assignment_blocks})..."
+            )
+        assignment_stats = self._assignment_stats()
+        n_genes = len(assignment_stats)
+        if len(synthetic_df) < n_genes:
+            raise ValueError("Fewer synthetic profiles than real genes. Increase overgeneration_factor.")
+
         synthetic_subset = synthetic_df.reset_index(drop=True)
-        w = np.array([weights['mean'], weights['variance'], weights['zero_prop']])
         eps = 1e-10
 
-        # Log-space cost (captures relative-scale similarity)
+        # Convert to contiguous numpy arrays once (avoid chained DataFrame ops).
+        # Full mode stays float64 to match the original main-branch solver path.
+        orig_arr64 = assignment_stats[['mean','variance','zero_prop']].to_numpy(dtype=np.float64)
+        synth_arr64 = synthetic_subset[['mean','variance','zero_prop']].to_numpy(dtype=np.float64)
+
+        if not assignment_blocks:
+            w = np.array([weights['mean'], weights['variance'], weights['zero_prop']], dtype=np.float64)
+
+            scaler_log = StandardScaler()
+            orig_log = scaler_log.fit_transform(np.log10(np.clip(orig_arr64, eps, None)))
+            synth_log = scaler_log.transform(np.log10(np.clip(synth_arr64, eps, None)))
+            cost_log = cdist(orig_log * w, synth_log * w, 'euclidean')
+
+            scaler_raw = StandardScaler()
+            orig_raw = scaler_raw.fit_transform(np.clip(orig_arr64, 0, None))
+            synth_raw = scaler_raw.transform(np.clip(synth_arr64, 0, None))
+            cost_raw = cdist(orig_raw * w, synth_raw * w, 'euclidean')
+
+            norm = max(float(cost_log.mean()), float(cost_raw.mean()), eps)
+            cost_matrix = hybrid_alpha * (cost_log / norm) + (1 - hybrid_alpha) * (cost_raw / norm)
+            row_ind, col_ind = _solve_assignment(cost_matrix, assignment_solver)
+
+            if verbose:
+                print("✓ Assignment complete.")
+            assigned_df = synthetic_subset.iloc[col_ind].reset_index(drop=True)
+            assigned_df['gene_id'] = assignment_stats.index[row_ind]
+            return assigned_df[['gene_id', 'mean', 'variance', 'zero_prop']]
+
+        multiplier = int(assignment_block_multiplier)
+        if multiplier < 1:
+            raise ValueError("assignment_block_multiplier must be >= 1.")
+
+        w = np.array([weights['mean'], weights['variance'], weights['zero_prop']], dtype=np.float32)
+        orig_arr = orig_arr64.astype(np.float32, copy=False)
+        synth_arr = synth_arr64.astype(np.float32, copy=False)
+
         scaler_log = StandardScaler()
-        orig_log = scaler_log.fit_transform(np.log10(assignment_stats[['mean','variance','zero_prop']].clip(lower=eps)))
-        synth_log = scaler_log.transform(np.log10(synthetic_subset[['mean','variance','zero_prop']].clip(lower=eps)))
-        cost_log = cdist(orig_log * w, synth_log * w, 'euclidean')
+        orig_log = scaler_log.fit_transform(
+            np.log10(np.clip(orig_arr, eps, None))
+        ).astype(np.float32) * w
+        synth_log = scaler_log.transform(
+            np.log10(np.clip(synth_arr, eps, None))
+        ).astype(np.float32) * w
 
-        # Raw z-score cost (captures absolute-scale similarity, especially for high-expression genes)
         scaler_raw = StandardScaler()
-        orig_raw = scaler_raw.fit_transform(assignment_stats[['mean','variance','zero_prop']].clip(lower=0))
-        synth_raw = scaler_raw.transform(synthetic_subset[['mean','variance','zero_prop']].clip(lower=0))
-        cost_raw = cdist(orig_raw * w, synth_raw * w, 'euclidean')
+        orig_raw = scaler_raw.fit_transform(
+            np.clip(orig_arr, 0, None)
+        ).astype(np.float32) * w
+        synth_raw = scaler_raw.transform(
+            np.clip(synth_arr, 0, None)
+        ).astype(np.float32) * w
 
-        # Normalize by shared mean so α actually controls the mix
-        norm = max(cost_log.mean(), cost_raw.mean(), eps)
-        cost_matrix = hybrid_alpha * (cost_log / norm) + (1 - hybrid_alpha) * (cost_raw / norm)
+        # Estimate norm from a small sample
+        sample_n = min(n_genes, 200)
+        s_log = cdist(orig_log[:sample_n], synth_log, 'euclidean')
+        s_raw = cdist(orig_raw[:sample_n], synth_raw, 'euclidean')
+        norm = max(float(s_log.mean()), float(s_raw.mean()), eps)
+        del s_log, s_raw
 
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        n_candidates = len(synthetic_subset)
+        # Batched assignment: solve small Hungarians per batch
+        # (~4000 × 32000 = 1 GB float64).  Avoids the 5.6 GB full cost
+        # matrix that causes swapping.  Larger multiplier gives each batch
+        # more candidate choices, improving match quality.
+        if assignment_block_size is None:
+            batch_size = max(500, int(100e6 / n_candidates))  # ~100 MB per batch
+        else:
+            batch_size = int(assignment_block_size)
+            if batch_size < 1:
+                raise ValueError("assignment_block_size must be a positive integer.")
+        batch_size = min(batch_size, n_genes)
+        alpha_f = np.float64(hybrid_alpha)
+        alpha_r = np.float64(1.0 - hybrid_alpha)
+        inv_norm = np.float64(1.0 / norm)
+
+        assigned_rows = []
+        assigned_cols = []
+        remaining = list(range(n_candidates))
+
+        for b_start in range(0, n_genes, batch_size):
+            b_end = min(b_start + batch_size, n_genes)
+            b_genes = b_end - b_start
+
+            pool_size = min(len(remaining), b_genes * multiplier)
+            if pool_size < b_genes:
+                raise RuntimeError("Not enough remaining synthetic candidates for batched assignment.")
+            # Pick candidates from the remaining ordered pool.  The synthetic pool
+            # itself is already seeded by the copula sampler.
+            cand_idx = remaining[:pool_size]
+
+            b_orig_log = orig_log[b_start:b_end]
+            b_orig_raw = orig_raw[b_start:b_end]
+            b_synth_log = synth_log[cand_idx]
+            b_synth_raw = synth_raw[cand_idx]
+            c_log = cdist(b_orig_log, b_synth_log, 'euclidean')
+            c_raw = cdist(b_orig_raw, b_synth_raw, 'euclidean')
+            cost_batch = (alpha_f * c_log + alpha_r * c_raw) * inv_norm
+
+            row_ind, col_ind = _solve_assignment(cost_batch, assignment_solver)
+            assigned_set = {cand_idx[c] for c in col_ind}
+            for r, c in zip(row_ind, col_ind):
+                assigned_rows.append(b_start + r)
+                assigned_cols.append(cand_idx[c])
+            # Remove only the assigned candidates from the pool
+            remaining = [x for x in remaining if x not in assigned_set]
+
+        row_ind = np.array(assigned_rows, dtype=np.intp)
+        col_ind = np.array(assigned_cols, dtype=np.intp)
+
+        if verbose:
+            print("✓ Assignment complete.")
         assigned_df = synthetic_subset.iloc[col_ind].reset_index(drop=True)
         assigned_df['gene_id'] = assignment_stats.index[row_ind]
 
-        if verbose: print("✓ Assignment complete.")
         return assigned_df[['gene_id', 'mean', 'variance', 'zero_prop']]
 
     def assign_to_genes_copula_rank(
@@ -366,11 +544,11 @@ class GeneParameterSimulator:
 
         n_genes = len(self.original_stats)
         synthetic_subset = synthetic_df.reset_index(drop=True)
-        sampled_u = np.asarray(synthetic_uniform, dtype=float)
+        sampled_u = np.asarray(synthetic_uniform, dtype=np.float32)
 
-        original_u = pseudo_observations(self.original_stats).to_numpy(dtype=float)
-        weight_vector = _assignment_weight_vector(weights)
-        cost_matrix = cdist(original_u * weight_vector, sampled_u * weight_vector, 'euclidean')
+        original_u = pseudo_observations(self.original_stats).to_numpy(dtype=np.float32)
+        weight_vector = _assignment_weight_vector(weights).astype(np.float32)
+        cost_matrix = cdist(original_u * weight_vector, sampled_u * weight_vector, 'euclidean').astype(np.float32)
 
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
         assigned_df = synthetic_subset.iloc[col_ind].reset_index(drop=True)
@@ -404,6 +582,11 @@ class GeneParameterSimulator:
         overgeneration_factor=2.0,
         verbose=True,
         use_distributional_alteration: bool = False,
+        assignment_solver: str = 'scipy',
+        assignment_n_jobs: int = 1,
+        assignment_blocks: bool = True,
+        assignment_block_size: Optional[int] = None,
+        assignment_block_multiplier: int = 8,
     ):
         """Build the gene-indexed target parameter table for an integrated simulation.
 
@@ -486,9 +669,17 @@ class GeneParameterSimulator:
                 random_seed=random_seed or 42,
                 verbose=verbose,
                 hybrid_alpha=getattr(self, 'hybrid_alpha', 0.2),
+                assignment_solver=assignment_solver,
+                n_jobs=assignment_n_jobs,
+                assignment_blocks=assignment_blocks,
+                assignment_block_size=assignment_block_size,
+                assignment_block_multiplier=assignment_block_multiplier,
             )
             assignment_diag = {'assignment_method': 'hybrid',
                                'hybrid_alpha': getattr(self, 'hybrid_alpha', 0.2),
+                               'assignment_blocks': bool(assignment_blocks),
+                               'assignment_block_size': assignment_block_size,
+                               'assignment_block_multiplier': int(assignment_block_multiplier),
                                'weights': assignment_weights or {'mean': 3.0, 'variance': 1.0, 'zero_prop': 1.0}}
         diagnostics = {
             'simulation_mode': 'generative',
@@ -805,6 +996,9 @@ def _finite_sample_correct_zip(pi0, lam, target_stats, n_spots, boundary=None):
             pi0 = min(pi0 + 0.10 * (target_zero - real_zero), 0.99)
         elif real_zero > target_zero:
             pi0 = max(pi0 - 0.10 * (real_zero - target_zero), 0.0)
+    # Guarantee exact mean match: (1-pi0)*lambda = target_mean
+    if target_mean > 1e-10:
+        lam = target_mean / max(1.0 - pi0, 1e-8)
     return pi0, lam
 
 def _estimate_zinb_by_moment_optimization(mu_total, var_total, zero_prop,
@@ -868,6 +1062,9 @@ def _finite_sample_correct_zinb(pi0, mu, r, target_stats, n_spots, boundary=None
             pi0 = min(pi0 + 0.10 * (target_zero - real_zero), 0.99)
         elif real_zero > target_zero:
             pi0 = max(pi0 - 0.10 * (real_zero - target_zero), 0.0)
+    # Guarantee exact mean match: (1-pi0)*mu = target_mean
+    if target_mean > 1e-10:
+        mu = target_mean / max(1.0 - pi0, 1e-8)
     return pi0, mu, r
 
 def _select_model_with_heuristic(mu_total, var_total, zero_prop,
@@ -920,36 +1117,14 @@ def _estimate_params_no_fallback(model_name, mu_total, var_total, zero_prop,
                                                       n_spots=n_spots, boundary=boundary)
     return {}
 
-def convert_params_for_new_simulator(stats_df: pd.DataFrame,
-                                     n_spots: int = None,
-                                     boundary_multiplier: float = 1.1):
-    """
-    Converts a DataFrame of statistics (mean, variance, zero_prop) into
-    parameters for specific count models (ZINB, etc.) using improved
-    excess-zero model selection and optional finite-sample moment correction.
-
-    Args:
-        stats_df: gene-level (mean, variance, zero_prop) table
-        n_spots: if provided, enable finite-sample moment correction
-        boundary_multiplier: max count boundary for finite-sample simulation
-    """
-    if 'gene_id' in stats_df.columns:
-        stats_df = stats_df.set_index('gene_id')
-    stats_df = stats_df[STAT_COLUMNS].copy()
-    print(f"\n--- [CONVERTING] Converting {len(stats_df)} parameter sets via excess-zero model selection ---")
-    if n_spots is not None:
-        print(f"  Finite-sample correction enabled (n={n_spots}, boundary={boundary_multiplier}x)")
-
-    output_dict = {'genes': {}, 'model_selected': [], 'marginal_param1': []}
+def _convert_gene_batch(gene_batch, n_spots, boundary_multiplier):
+    """Convert one batch of genes to count-model params (worker for joblib)."""
+    model_selected = []
+    marginal_param1 = []
     model_counts = {}
     debug_stats = []
 
-    for i, (gene_id, record) in enumerate(stats_df.iterrows()):
-        record_dict = record.to_dict()
-        mu = record_dict['mean']
-        var = record_dict['variance']
-        zp = record_dict['zero_prop']
-
+    for i, gene_id, mu, var, zp in gene_batch:
         overdispersion = var / mu if mu > 1e-8 else 0
         zero_pois = np.exp(-mu) if mu > 1e-8 else 1.0
         excess_zero = zp - zero_pois
@@ -963,9 +1138,8 @@ def convert_params_for_new_simulator(stats_df: pd.DataFrame,
         params = _estimate_params_no_fallback(model_type, mu, var, zp,
                                                n_spots=n_spots,
                                                boundary=boundary_multiplier)
-        
         model_counts[model_type] = model_counts.get(model_type, 0) + 1
-        
+
         pi0, r, mean_param = 0.0, np.inf, 0.0
         if model_type == 'Poisson':
             mean_param = params.get('lambda', 1e-8)
@@ -975,11 +1149,79 @@ def convert_params_for_new_simulator(stats_df: pd.DataFrame,
             pi0, mean_param = params.get('pi0', 0.0), params.get('lambda', 1e-8)
         elif model_type == 'ZINB':
             pi0, mean_param, r = params.get('pi0', 0.0), params.get('mu', 1e-8), params.get('r', np.inf)
-        
-        output_dict['genes'][i] = gene_id
-        output_dict['model_selected'].append(model_type)
-        output_dict['marginal_param1'].append([pi0, r, mean_param])
-    
+
+        model_selected.append(model_type)
+        marginal_param1.append([pi0, r, mean_param])
+
+    return {
+        'model_selected': model_selected,
+        'marginal_param1': marginal_param1,
+        'model_counts': model_counts,
+        'debug_stats': debug_stats,
+    }
+
+
+def convert_params_for_new_simulator(stats_df: pd.DataFrame,
+                                     n_spots: int = None,
+                                     boundary_multiplier: float = 1.1,
+                                     n_jobs: int = 1):
+    """
+    Converts a DataFrame of statistics (mean, variance, zero_prop) into
+    parameters for specific count models (ZINB, etc.) using improved
+    excess-zero model selection and optional finite-sample moment correction.
+
+    Args:
+        stats_df: gene-level (mean, variance, zero_prop) table
+        n_spots: if provided, enable finite-sample moment correction
+        boundary_multiplier: max count boundary for finite-sample simulation
+        n_jobs: number of parallel workers (1 = sequential)
+    """
+    if 'gene_id' in stats_df.columns:
+        stats_df = stats_df.set_index('gene_id')
+    stats_df = stats_df[STAT_COLUMNS].copy()
+    n_genes = len(stats_df)
+    print(f"\n--- [CONVERTING] Converting {n_genes} parameter sets via excess-zero model selection ---")
+    if n_spots is not None:
+        print(f"  Finite-sample correction enabled (n={n_spots}, boundary={boundary_multiplier}x)")
+    if n_jobs > 1:
+        print(f"  Parallel workers: {n_jobs}")
+
+    # Build per-gene records
+    records = [(i, gene_id, row['mean'], row['variance'], row['zero_prop'])
+               for i, (gene_id, row) in enumerate(stats_df.iterrows())]
+
+    if n_jobs > 1:
+        from joblib import Parallel, delayed
+        chunk_size = max(1, n_genes // (n_jobs * 4))
+        batches = [records[i:i + chunk_size] for i in range(0, n_genes, chunk_size)]
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(_convert_gene_batch)(batch, n_spots, boundary_multiplier)
+            for batch in batches
+        )
+        # Merge
+        output_dict = {'genes': {i: stats_df.index[i] for i in range(n_genes)},
+                       'model_selected': [], 'marginal_param1': []}
+        model_counts = {}
+        debug_stats = []
+        for r in results:
+            output_dict['model_selected'].extend(r['model_selected'])
+            output_dict['marginal_param1'].extend(r['marginal_param1'])
+            for k, v in r['model_counts'].items():
+                model_counts[k] = model_counts.get(k, 0) + v
+            debug_stats.extend(r['debug_stats'])
+    else:
+        output_dict = {'genes': {i: stats_df.index[i] for i in range(n_genes)},
+                       'model_selected': [], 'marginal_param1': []}
+        model_counts = {}
+        debug_stats = []
+        for rec in records:
+            r = _convert_gene_batch([rec], n_spots, boundary_multiplier)
+            output_dict['model_selected'].extend(r['model_selected'])
+            output_dict['marginal_param1'].extend(r['marginal_param1'])
+            for k, v in r['model_counts'].items():
+                model_counts[k] = model_counts.get(k, 0) + v
+            debug_stats.extend(r['debug_stats'])
+
     # Debug output
     debug_df = pd.DataFrame(debug_stats)
     print(f"  > Model selection summary: {model_counts}")
@@ -987,6 +1229,6 @@ def convert_params_for_new_simulator(stats_df: pd.DataFrame,
     print(f"  > Mean overdispersion: {debug_df['overdispersion'].mean():.2f}")
     print(f"  > Mean zero proportion: {debug_df['zero_prop'].mean():.3f}")
     print(f"  > Mean excess zero (obs - Poisson): {debug_df['excess_zero'].mean():.4f}")
-        
+
     print("✓ Conversion complete.")
     return output_dict

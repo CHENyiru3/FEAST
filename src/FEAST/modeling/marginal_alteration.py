@@ -76,6 +76,8 @@ class MarginalModelAlterator:
 
         if hasattr(target_modeler, '_ppf_cache'):
             target_modeler._ppf_cache.clear()
+        if hasattr(target_modeler, '_ppf_interp'):
+            delattr(target_modeler, '_ppf_interp')
         
         # Verify results
         if verbose:
@@ -413,7 +415,7 @@ class AlterationConfig:
         self.apply_to_zero_prop = apply_to_zero_prop
         # Resolve sparsity: δ_z takes precedence over deprecated α_z
         if sparsity_fold_change is not None and sparsity_logit_shift == 0.0:
-            self.sparsity_logit_shift = float(sparsity_fold_change)
+            self.sparsity_logit_shift = float(np.log(max(float(sparsity_fold_change), 1e-4)))
         else:
             self.sparsity_logit_shift = float(sparsity_logit_shift)
         # Backward-compat alias
