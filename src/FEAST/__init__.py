@@ -29,11 +29,10 @@ __version__ = "1.0.2"
 # ---------------------------------------------------------------------------
 
 from .FEAST_core.simulator import simulate_single_slice as _simulate_single_slice
-from .FEAST_core.simulator import simulate_batch_effect as _simulate_batch_effect
 from .FEAST_core.parameter_cloud import GeneParameterSimulator
 from .FEAST_core.count_decoding import decode_counts_by_rank as _decode_counts_by_rank
 from .FEAST_core.theta_transform import stats_to_theta, theta_to_stats
-from .modeling.marginal_alteration import AlterationConfig
+from .modeling.marginal_alteration import AlterationConfig as _AlterationConfig
 from .de_novo.builder import simulate_from_design as _simulate_from_design
 from .de_novo.conditional import fit_reference as _fit_reference
 from .de_novo.conditional import simulate_from_reference as _simulate_from_reference
@@ -41,10 +40,10 @@ from .de_novo.conditional import ReferenceFitConfig, SimulationConfig
 from .de_novo.core import SliceBlueprint
 
 # ---------------------------------------------------------------------------
-# Alteration — renamed for clarity
+# Alteration — public name for the former AlterationConfig class
 # ---------------------------------------------------------------------------
 
-Alteration = AlterationConfig  # new public name
+Alteration = _AlterationConfig
 
 # ---------------------------------------------------------------------------
 # Public functions
@@ -54,7 +53,7 @@ Alteration = AlterationConfig  # new public name
 def simulate(
     adata,
     *,
-    alteration: AlterationConfig | None = None,
+    alteration: _AlterationConfig | None = None,
     seed: int | None = None,
     parameter_mode: str = "hungarian",
     spatial_mode: str = "reference_rank",
@@ -255,20 +254,6 @@ def decode(params, rank_scores):
 
 
 # ---------------------------------------------------------------------------
-# Backward-compatibility aliases
-# ---------------------------------------------------------------------------
-
-# Keep old names working for existing scripts
-from .FEAST_core import simulator
-from .modeling.marginal_alteration import AlterationConfig  # old name still works
-
-AlterationConfig.__doc__ = (
-    "Deprecated alias — use :class:`Alteration` instead.  "
-    "Identical class, kept for backward compatibility.\n\n" +
-    (AlterationConfig.__doc__ or "")
-)
-
-# ---------------------------------------------------------------------------
 # Lazy subpackage loading
 # ---------------------------------------------------------------------------
 
@@ -283,8 +268,7 @@ DE_NOVO_AVAILABLE = _module_exists(__name__ + ".de_novo")
 
 def __getattr__(name: str):
     # Lazy-load subpackages (and the new spatial_transform module)
-    if name in ("alignment", "deconvolution", "de_novo", "spatial_transform",
-                "modeling", "FEAST_core"):
+    if name in ("alignment", "deconvolution", "de_novo", "spatial_transform"):
         return _import_module(__name__ + "." + name)
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
@@ -302,7 +286,6 @@ __all__ = [
     "decode",
     # Alteration
     "Alteration",
-    "AlterationConfig",  # backward compat
     # Classes
     "GeneParameterSimulator",
     "SliceBlueprint",
@@ -312,13 +295,10 @@ __all__ = [
     "stats_to_theta",
     "theta_to_stats",
     # Subpackages
-    "simulator",
     "alignment",
     "deconvolution",
     "de_novo",
     "spatial_transform",
-    "modeling",
-    "FEAST_core",
     # Availability flags
     "ALIGNMENT_AVAILABLE",
     "DECONVOLUTION_AVAILABLE",

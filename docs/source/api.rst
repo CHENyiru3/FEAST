@@ -1,37 +1,42 @@
 API Reference
 =============
 
+Public API
+----------
+
 .. automodule:: FEAST
-   :members:
+   :members: simulate, generate, generate_from, fit, decode, Alteration
    :imported-members: false
 
-Core simulation engine
-----------------------
+Classes
+-------
 
-.. automodule:: FEAST.FEAST_core.simulator
+.. autoclass:: FEAST.GeneParameterSimulator
    :members:
 
-.. automodule:: FEAST.FEAST_core.APIs
-   :members:
-   :exclude-members: simulate_single_slice
-
-.. automodule:: FEAST.FEAST_core.parameter_cloud
+.. autoclass:: FEAST.SliceBlueprint
    :members:
 
-Count decoding
-~~~~~~~~~~~~~~
-
-.. automodule:: FEAST.FEAST_core.count_decoding
+.. autoclass:: FEAST.ReferenceFitConfig
    :members:
 
-Theta transform
-~~~~~~~~~~~~~~~
-
-.. automodule:: FEAST.FEAST_core.theta_transform
+.. autoclass:: FEAST.SimulationConfig
    :members:
 
-Alignment
----------
+Utility functions
+-----------------
+
+.. autofunction:: FEAST.stats_to_theta
+.. autofunction:: FEAST.theta_to_stats
+
+Spatial transforms
+------------------
+
+.. automodule:: FEAST.spatial_transform
+   :members:
+
+Alignment subpackage
+--------------------
 
 .. automodule:: FEAST.alignment
    :members:
@@ -42,8 +47,8 @@ Alignment
 .. automodule:: FEAST.alignment.spatial_align_alter
    :members:
 
-Deconvolution
--------------
+Deconvolution subpackage
+------------------------
 
 .. automodule:: FEAST.deconvolution
    :members:
@@ -54,8 +59,8 @@ Deconvolution
 .. automodule:: FEAST.deconvolution.generate_deconvolution
    :members:
 
-De novo generation
-------------------
+De novo generation subpackage
+-----------------------------
 
 .. automodule:: FEAST.de_novo
    :members:
@@ -78,10 +83,19 @@ De novo generation
 .. automodule:: FEAST.de_novo.stack
    :members:
 
-Statistical models
-------------------
+Internal modules
+----------------
 
-.. automodule:: FEAST.modeling
+.. automodule:: FEAST.FEAST_core.simulator
+   :members:
+
+.. automodule:: FEAST.FEAST_core.parameter_cloud
+   :members:
+
+.. automodule:: FEAST.FEAST_core.count_decoding
+   :members:
+
+.. automodule:: FEAST.FEAST_core.theta_transform
    :members:
 
 .. automodule:: FEAST.modeling.StudentT_mixture_model
