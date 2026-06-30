@@ -12,9 +12,6 @@ Alteration
 ----------
 :class:`Alteration`   — expression alteration configuration for :func:`simulate`.
 
-Spatial transforms
-------------------
-:mod:`FEAST.spatial_transform` — :func:`~spatial_transform.rotate`, :func:`~spatial_transform.warp`.
 """
 
 from __future__ import annotations
@@ -36,7 +33,7 @@ from .modeling.marginal_alteration import AlterationConfig as _AlterationConfig
 from .de_novo.builder import simulate_from_design as _simulate_from_design
 from .de_novo.conditional import fit_reference as _fit_reference
 from .de_novo.conditional import simulate_from_reference as _simulate_from_reference
-from .de_novo.conditional import ReferenceFitConfig, SimulationConfig
+from .de_novo.conditional import ReferenceFitConfig, SimulationConfig, estimate_assignment_randomness
 from .de_novo.core import SliceBlueprint
 
 # ---------------------------------------------------------------------------
@@ -267,8 +264,8 @@ DE_NOVO_AVAILABLE = _module_exists(__name__ + ".de_novo")
 
 
 def __getattr__(name: str):
-    # Lazy-load subpackages (and the new spatial_transform module)
-    if name in ("alignment", "deconvolution", "de_novo", "spatial_transform"):
+    # Lazy-load subpackages
+    if name in ("alignment", "deconvolution", "de_novo"):
         return _import_module(__name__ + "." + name)
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
@@ -291,6 +288,7 @@ __all__ = [
     "SliceBlueprint",
     "ReferenceFitConfig",
     "SimulationConfig",
+    "estimate_assignment_randomness",
     # Functions
     "stats_to_theta",
     "theta_to_stats",
@@ -298,7 +296,6 @@ __all__ = [
     "alignment",
     "deconvolution",
     "de_novo",
-    "spatial_transform",
     # Availability flags
     "ALIGNMENT_AVAILABLE",
     "DECONVOLUTION_AVAILABLE",

@@ -1017,3 +1017,228 @@ def _stats_frame_to_model_params(stats: pd.DataFrame) -> dict:
         "model_selected": model_selected,
         "marginal_param1": marginal_param1,
     }
+
+
+# ---------------------------------------------------------------------------
+# Auto-estimation of assignment_randomness via mini-sweep
+# ---------------------------------------------------------------------------
+
+
+def estimate_assignment_randomness(
+    reference: "ad.AnnData | SimulationReference",
+    label_key: str | None = None,
+    *,
+    spatial_key: str = "spatial",
+    n_genes: int = 20,
+    ar_step: float = 0.1,
+    max_ar: float = 0.5,
+    n_neighbors: int = 6,
+    random_seed: int | None = None,
+) -> float:
+    """Estimate assignment_randomness via a quick mini-sweep on the reference.
+
+    Spatially splits the reference in half, runs the full de-novo conditional
+    pipeline on a small gene panel at each AR candidate, and returns the value
+    that best preserves spatial autocorrelation (Moran's I correlation between
+    generated and held-out halves).
+
+    This mirrors the logic of the full cross-slice benchmark but operates on a
+    single slice split, with a small gene set, so it completes in seconds.
+
+    Parameters
+    ----------
+    reference:
+        Reference :class:`~anndata.AnnData` or a fitted
+        :class:`SimulationReference`.  If an AnnData, *label_key* must
+        be provided.
+    label_key:
+        Column in ``.obs`` with domain/region labels.  Required when
+        *reference* is an AnnData.
+    spatial_key:
+        Key in ``.obsm`` for spatial coordinates (default ``"spatial"``).
+    n_genes:
+        Number of high-variance genes to use in the mini-sweep.  More
+        genes improve stability but increase runtime linearly.
+    ar_step:
+        Step size between AR candidates.  Tested values are
+        ``[0.0, ar_step, 2*ar_step, ..., max_ar]``.  Use a finer step
+        (e.g. 0.05) for higher precision at the cost of more OT runs.
+    max_ar:
+        Maximum AR value to test.  Values above ~0.5 rarely help.
+    n_neighbors:
+        Number of spatial neighbors for Moran's-I computation.
+    random_seed:
+        Seed for reproducible results.
+
+    Returns
+    -------
+    float
+        Estimated assignment_randomness in [0.0, *max_ar*].
+
+    Notes
+    -----
+    If the reference has fewer than 50 spots, only a single domain label,
+    or the spatial split fails to produce two viable halves, the function
+    returns 0.0 (pure OT, no randomness).
+    """
+    # --- resolve input ---
+    if isinstance(reference, SimulationReference):
+        if label_key is None:
+            label_key = reference.label_key
+        if not reference.references:
+            return 0.0
+        # Use the largest reference slice for estimation (most label coverage)
+        adata = max(reference.references, key=lambda r: r.adata.n_obs).adata
+    else:
+        adata = reference
+        if label_key is None:
+            raise ValueError("label_key is required when reference is an AnnData.")
+    if label_key not in adata.obs:
+        raise KeyError(f"label_key {label_key!r} not found in adata.obs.")
+
+    if spatial_key in adata.obsm:
+        coords = np.asarray(adata.obsm[spatial_key], dtype=float)
+    else:
+        coords = _coordinates(adata)
+    coords_2d = coords[:, :2]
+    n_spots = coords_2d.shape[0]
+    if n_spots < 50:
+        return 0.0
+
+    labels = adata.obs[label_key].astype(str).to_numpy()
+    unique_labels = np.unique(labels)
+    if len(unique_labels) < 2:
+        return 0.0
+
+    # --- subsample if too large for quick OT ---
+    max_spots = 10000
+    if n_spots > max_spots:
+        rng = np.random.default_rng(random_seed or 0)
+        keep = rng.choice(n_spots, size=max_spots, replace=False)
+        adata = adata[keep, :].copy()
+        coords_2d = coords_2d[keep, :]
+        labels = labels[keep]
+        n_spots = max_spots
+
+    # --- select high-variance genes ---
+    matrix = _to_dense_matrix(adata.X)
+    variances = np.var(matrix, axis=0, ddof=0)
+    top_idx = np.argsort(-variances)[: min(n_genes, adata.n_vars)]
+    if len(top_idx) < 5:
+        return 0.0
+    gene_names = [str(adata.var_names[i]) for i in top_idx]
+    adata_sub = adata[:, gene_names].copy()
+
+    # --- spatial split into reference / target halves ---
+    axis = int(np.argmax(np.ptp(coords_2d, axis=0)))
+    median = float(np.median(coords_2d[:, axis]))
+    ref_mask = coords_2d[:, axis] <= median
+    tgt_mask = ~ref_mask
+    if ref_mask.sum() < 20 or tgt_mask.sum() < 20:
+        return 0.0
+
+    ref_adata = adata_sub[ref_mask, :].copy()
+    tgt_adata = adata_sub[tgt_mask, :].copy()
+
+    # ensure both halves share the same label set
+    ref_label_set = set(np.unique(ref_adata.obs[label_key].astype(str)))
+    tgt_label_set = set(np.unique(tgt_adata.obs[label_key].astype(str)))
+    common_labels = ref_label_set & tgt_label_set
+    if len(common_labels) < 2:
+        return 0.0
+
+    if common_labels != ref_label_set or common_labels != tgt_label_set:
+        r_mask = ref_adata.obs[label_key].astype(str).isin(common_labels).to_numpy()
+        t_mask = tgt_adata.obs[label_key].astype(str).isin(common_labels).to_numpy()
+        ref_adata = ref_adata[r_mask, :].copy()
+        tgt_adata = tgt_adata[t_mask, :].copy()
+        if ref_adata.n_obs < 20 or tgt_adata.n_obs < 20:
+            return 0.0
+
+    # --- fit reference on the left half ---
+    fit_cfg = ReferenceFitConfig(min_gene_spots=1, min_gene_mean=0.0, max_gene_zero_prop=1.0)
+    model = fit_reference(ref_adata, label_key=label_key, config=fit_cfg)
+    if not model.gene_names:
+        return 0.0
+
+    # align target to model genes
+    model_genes = list(model.gene_names)
+    tgt_aligned = tgt_adata[:, model_genes].copy()
+
+    # --- pre-compute target Moran's I (same for all AR values) ---
+    tgt_coords = np.asarray(tgt_aligned.obsm.get(spatial_key, _coordinates(tgt_aligned)), dtype=float)[:, :2]
+    tgt_n = tgt_coords.shape[0]
+    k = min(n_neighbors + 1, tgt_n)
+    tgt_nn = NearestNeighbors(n_neighbors=k).fit(tgt_coords)
+    tgt_neigh = tgt_nn.kneighbors(tgt_coords, return_distance=False)[:, 1:]
+    tgt_matrix = _to_dense_matrix(tgt_aligned.X)
+
+    tgt_morans = _per_gene_moran(tgt_matrix, tgt_neigh)
+    tgt_valid = np.isfinite(tgt_morans)
+    if tgt_valid.sum() < 5:
+        return 0.0
+    tgt_morans = tgt_morans[tgt_valid]
+    tgt_matrix = tgt_matrix[:, tgt_valid]
+    model_genes = [g for i, g in enumerate(model_genes) if tgt_valid[i]]
+
+    # --- mini-sweep over AR values ---
+    blueprint = SliceBlueprint(
+        coordinates=tgt_coords,
+        domain_map=tgt_aligned.obs[label_key].astype(str).to_numpy(),
+    )
+    ar_candidates = np.arange(0.0, float(max_ar) + 1e-9, float(ar_step))
+    if len(ar_candidates) < 2:
+        ar_candidates = np.array([0.0, float(max_ar)])
+
+    best_ar = 0.0
+    best_corr = -np.inf
+    correlations = []
+
+    for ar in ar_candidates:
+        gen_cfg = SimulationConfig(assignment_randomness=float(ar), verbose=False)
+        generated = simulate_from_reference(
+            model, blueprint, config=gen_cfg, random_seed=random_seed or 0,
+        )
+        gen_matrix = _to_dense_matrix(generated.X)
+        gen_morans = _per_gene_moran(gen_matrix, tgt_neigh)
+        gen_valid = np.isfinite(gen_morans)
+        if gen_valid.sum() < 5:
+            continue
+        g = gen_morans[gen_valid]
+        t = tgt_morans[gen_valid]
+        if np.std(g) <= 1e-12 or np.std(t) <= 1e-12:
+            continue
+        corr = float(np.corrcoef(g, t)[0, 1])
+        if not np.isfinite(corr):
+            continue
+        correlations.append((float(ar), corr))
+        if corr > best_corr:
+            best_corr = corr
+            best_ar = float(ar)
+
+    if not correlations:
+        return 0.0
+    return best_ar
+
+
+def _per_gene_moran(
+    matrix: np.ndarray,
+    neigh_idx: np.ndarray,
+) -> np.ndarray:
+    """Compute per-gene Moran's I on a dense (spots x genes) matrix."""
+    n_spots, n_genes = matrix.shape
+    out = np.full(n_genes, np.nan, dtype=np.float64)
+    for j in range(n_genes):
+        x = matrix[:, j].astype(np.float64)
+        z = x - np.mean(x)
+        denom = float(np.dot(z, z))
+        if denom <= 1e-12:
+            continue
+        num = 0.0
+        w_sum = 0.0
+        for i, neigh in enumerate(neigh_idx):
+            num += float(np.sum(z[i] * z[neigh]))
+            w_sum += len(neigh)
+        if w_sum > 0:
+            out[j] = (n_spots / w_sum) * (num / denom)
+    return out
