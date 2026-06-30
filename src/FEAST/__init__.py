@@ -12,9 +12,6 @@ Alteration
 ----------
 :class:`Alteration`   — expression alteration configuration for :func:`simulate`.
 
-Spatial transforms
-------------------
-:mod:`FEAST.spatial_transform` — :func:`~spatial_transform.rotate`, :func:`~spatial_transform.warp`.
 """
 
 from __future__ import annotations
@@ -267,8 +264,8 @@ DE_NOVO_AVAILABLE = _module_exists(__name__ + ".de_novo")
 
 
 def __getattr__(name: str):
-    # Lazy-load subpackages (and the new spatial_transform module)
-    if name in ("alignment", "deconvolution", "de_novo", "spatial_transform"):
+    # Lazy-load subpackages
+    if name in ("alignment", "deconvolution", "de_novo"):
         return _import_module(__name__ + "." + name)
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
@@ -299,7 +296,6 @@ __all__ = [
     "alignment",
     "deconvolution",
     "de_novo",
-    "spatial_transform",
     # Availability flags
     "ALIGNMENT_AVAILABLE",
     "DECONVOLUTION_AVAILABLE",
