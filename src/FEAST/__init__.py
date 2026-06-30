@@ -26,7 +26,8 @@ __version__ = "1.0.2"
 # ---------------------------------------------------------------------------
 
 from .FEAST_core.simulator import simulate_single_slice as _simulate_single_slice
-from .FEAST_core.parameter_cloud import GeneParameterSimulator
+from .FEAST_core.simulator import simulate_batch_effect, characterize_batch
+from .FEAST_core.parameter_cloud import GeneParameterSimulator, BatchDeformation
 from .FEAST_core.count_decoding import decode_counts_by_rank as _decode_counts_by_rank
 from .FEAST_core.theta_transform import stats_to_theta, theta_to_stats
 from .modeling.marginal_alteration import AlterationConfig as _AlterationConfig
@@ -281,6 +282,10 @@ __all__ = [
     "generate_from",
     "fit",
     "decode",
+    # Batch effect
+    "simulate_batch_effect",
+    "characterize_batch",
+    "BatchDeformation",
     # Alteration
     "Alteration",
     # Classes
