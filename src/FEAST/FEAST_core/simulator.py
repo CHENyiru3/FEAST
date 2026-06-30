@@ -7,6 +7,7 @@ from scipy.spatial.distance import cdist
 
 from .count_decoding import decode_counts_by_rank
 from .parameter_cloud import (
+    BatchDeformation,
     GeneParameterSimulator,
     alteration_config_to_dict,
     calculate_fold_change,
@@ -349,6 +350,90 @@ def simulate_batch_effect(
     sim_adata.var["theta_omega_batch"] = theta_batch[:, 1]
     sim_adata.var["theta_pi0_batch"] = theta_batch[:, 2]
     return sim_adata
+
+
+def characterize_batch(
+    adata_ref,
+    adata_query,
+    *,
+    name: str = "",
+) -> "BatchDeformation":
+    """Estimate batch deformation (D, b) from two real slices via OLS in theta space.
+
+    For each dimension k in {log_mu, log_omega, logit_pi0}:
+        theta_query[:, k] = d_k * theta_ref[:, k] + b_k  (+ epsilon)
+
+    This is the empirical-characterisation counterpart to simulate_batch_effect().
+    Once (D, b) are estimated, they can be fed to simulate_batch_effect() with
+    alpha in [0, 1] to generate interpolated batch-effect ladder.
+
+    Parameters
+    ----------
+    adata_ref : AnnData    -- reference (clean) slice
+    adata_query : AnnData  -- batch-affected slice
+    name : str             -- optional label for the deformation
+
+    Returns
+    -------
+    BatchDeformation with additional diagnostic attributes:
+        .r2          : (3,) ndarray  — per-dimension R²
+        .residual_std: (3,) ndarray  — per-dimension residual std dev
+        .n_genes     : int           — number of common genes used
+    """
+    from scipy.sparse import issparse
+    from .theta_transform import stats_to_theta
+
+    X_ref = adata_ref.X.toarray() if issparse(adata_ref.X) else np.asarray(
+        adata_ref.X, dtype=np.float64
+    )
+    X_qry = adata_query.X.toarray() if issparse(adata_query.X) else np.asarray(
+        adata_query.X, dtype=np.float64
+    )
+
+    # Restrict to genes present in both
+    common_mask = np.intersect1d(adata_ref.var_names, adata_query.var_names, return_indices=True)
+    gene_idx_r, gene_idx_q = common_mask[1], common_mask[2]
+    if len(gene_idx_r) < 3:
+        raise ValueError(f"Fewer than 3 common genes found ({len(gene_idx_r)}).")
+
+    stats_ref = _gene_stats_from_matrix(
+        X_ref[:, gene_idx_r], list(adata_ref.var_names[gene_idx_r])
+    )
+    stats_qry = _gene_stats_from_matrix(
+        X_qry[:, gene_idx_q], list(adata_query.var_names[gene_idx_q])
+    )
+
+    theta_ref = stats_to_theta(stats_ref)
+    theta_qry = stats_to_theta(stats_qry)
+
+    D = np.ones(3, dtype=np.float64)
+    b = np.zeros(3, dtype=np.float64)
+    r2 = np.zeros(3, dtype=np.float64)
+    resid_std = np.zeros(3, dtype=np.float64)
+
+    for k in range(3):
+        x = theta_ref[:, k]
+        y = theta_qry[:, k]
+
+        ss_xx = np.sum((x - x.mean()) ** 2)
+        if ss_xx < 1e-15:
+            D[k], b[k] = 1.0, y.mean() - x.mean()
+            r2[k] = 0.0
+            resid_std[k] = float(np.std(y - y.mean()))
+        else:
+            D[k] = np.sum((x - x.mean()) * (y - y.mean())) / ss_xx
+            b[k] = y.mean() - D[k] * x.mean()
+            y_pred = D[k] * x + b[k]
+            ss_res = np.sum((y - y_pred) ** 2)
+            ss_tot = np.sum((y - y.mean()) ** 2)
+            r2[k] = max(0.0, min(1.0, 1.0 - ss_res / max(ss_tot, 1e-15)))
+            resid_std[k] = float(np.sqrt(ss_res / len(y)))
+
+    deform = BatchDeformation(D, b, alpha=1.0, name=name)
+    deform.r2 = r2
+    deform.residual_std = resid_std
+    deform.n_genes = len(gene_idx_r)
+    return deform
 
 
 class SpatialSimulator:
