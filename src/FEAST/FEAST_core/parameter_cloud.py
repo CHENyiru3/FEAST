@@ -443,8 +443,9 @@ class GeneParameterSimulator:
             raise ValueError("assignment_block_multiplier must be >= 1.")
 
         w = np.array([weights['mean'], weights['variance'], weights['zero_prop']], dtype=np.float32)
-        orig_arr = orig_arr64.astype(np.float32, copy=False)
-        synth_arr = synth_arr64.astype(np.float32, copy=False)
+        f32_max = np.finfo(np.float32).max
+        orig_arr = np.clip(orig_arr64, -f32_max, f32_max).astype(np.float32, copy=False)
+        synth_arr = np.clip(synth_arr64, -f32_max, f32_max).astype(np.float32, copy=False)
 
         scaler_log = StandardScaler()
         orig_log = scaler_log.fit_transform(
