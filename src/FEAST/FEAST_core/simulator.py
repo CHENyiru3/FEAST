@@ -17,6 +17,7 @@ from .parameter_cloud import (
 PARAMETER_MODES = ("hungarian", "reference_stats")
 SPATIAL_MODES = ("reference_rank", "ot_spatial")
 MAX_DENSE_OT_PAIRS = 25_000_000   # ~200 MB as float64; switches to block OT above this
+OT_MEMORY_BYTES_PER_PAIR = 64     # cost, plan, Sinkhorn kernel/work arrays, and temporaries
 
 # Internal translation: public parameter_mode ↔ internal simulation_mode
 _PARAMETER_TO_SIMULATION = {"hungarian": "generative", "reference_stats": "empirical"}
@@ -34,6 +35,81 @@ def _translate_spatial_mode(spatial_mode):
     if spatial_mode not in SPATIAL_MODES:
         raise ValueError(f"spatial_mode must be one of {SPATIAL_MODES}, got '{spatial_mode}'")
     return spatial_mode
+
+
+def _resolve_ot_block_max_pairs(max_block_pairs=None, memory_budget_gb=None):
+    """Resolve optional OT block controls to a maximum dense pair count."""
+    limits = []
+    if max_block_pairs is not None:
+        max_block_pairs = int(max_block_pairs)
+        if max_block_pairs < 1:
+            raise ValueError("ot_block_max_pairs must be a positive integer.")
+        limits.append(max_block_pairs)
+
+    if memory_budget_gb is not None:
+        memory_budget_gb = float(memory_budget_gb)
+        if not np.isfinite(memory_budget_gb) or memory_budget_gb <= 0:
+            raise ValueError("ot_memory_budget_gb must be a positive finite number.")
+        budget_bytes = memory_budget_gb * (1024 ** 3)
+        limits.append(max(1, int(budget_bytes // OT_MEMORY_BYTES_PER_PAIR)))
+
+    if not limits:
+        return None
+    return min(limits)
+
+
+def _split_indices_by_coordinate(indices, coords, axis, midpoint=None):
+    """Split indices spatially, falling back to a stable count split."""
+    indices = np.asarray(indices, dtype=np.int64)
+    if indices.size <= 1:
+        return indices, np.empty(0, dtype=np.int64)
+
+    if midpoint is not None:
+        left_mask = coords[indices, axis] <= midpoint
+        left = indices[left_mask]
+        right = indices[~left_mask]
+        if left.size and right.size:
+            return left, right
+
+    order = np.argsort(coords[indices, axis], kind="mergesort")
+    split_at = indices.size // 2
+    return indices[order[:split_at]], indices[order[split_at:]]
+
+
+def _iter_bounded_ot_subblocks(src_idx, tgt_idx, source_coords, target_coords, max_block_pairs):
+    """Yield spatial sub-blocks whose dense source-target pair count is bounded."""
+    if max_block_pairs is None:
+        yield np.asarray(src_idx, dtype=np.int64), np.asarray(tgt_idx, dtype=np.int64)
+        return
+
+    stack = [(np.asarray(src_idx, dtype=np.int64), np.asarray(tgt_idx, dtype=np.int64))]
+    while stack:
+        cur_src, cur_tgt = stack.pop()
+        if cur_src.size == 0 or cur_tgt.size == 0:
+            continue
+
+        pair_count = int(cur_src.size) * int(cur_tgt.size)
+        if pair_count <= max_block_pairs or (cur_src.size <= 1 and cur_tgt.size <= 1):
+            yield cur_src, cur_tgt
+            continue
+
+        combined_coords = np.vstack((source_coords[cur_src, :2], target_coords[cur_tgt, :2]))
+        axis = int(np.argmax(np.ptp(combined_coords, axis=0)))
+        midpoint = float(np.median(combined_coords[:, axis]))
+
+        if cur_src.size > 1 and cur_tgt.size > 1:
+            src_left, src_right = _split_indices_by_coordinate(cur_src, source_coords, axis, midpoint)
+            tgt_left, tgt_right = _split_indices_by_coordinate(cur_tgt, target_coords, axis, midpoint)
+            stack.append((src_right, tgt_right))
+            stack.append((src_left, tgt_left))
+        elif cur_src.size > 1:
+            src_left, src_right = _split_indices_by_coordinate(cur_src, source_coords, axis, midpoint)
+            stack.append((src_right, cur_tgt))
+            stack.append((src_left, cur_tgt))
+        else:
+            tgt_left, tgt_right = _split_indices_by_coordinate(cur_tgt, target_coords, axis, midpoint)
+            stack.append((cur_src, tgt_right))
+            stack.append((cur_src, tgt_left))
 
 
 
@@ -338,7 +414,7 @@ class SpatialSimulator:
         """Get current model parameters."""
         return self._model_params
     
-    def simulate(self, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.0, boundary_multiplier: float = 1.1, random_seed: int = None, spatial_mode: str = 'reference_rank', target_adata=None) -> ad.AnnData:
+    def simulate(self, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.0, boundary_multiplier: float = 1.1, random_seed: int = None, spatial_mode: str = 'reference_rank', target_adata=None, ot_block_size: int = 40000, ot_overlap_frac: float = 0.25, ot_block_max_pairs: int = None, ot_memory_budget_gb: float = None) -> ad.AnnData:
         """
         Args:
             num_simulation_cores (int): Number of cores for simulation (legacy parameter).
@@ -348,6 +424,13 @@ class SpatialSimulator:
             random_seed (int, optional): Seed for reproducible sampling.
             spatial_mode: 'reference_rank' or 'ot_spatial'.
             target_adata: Required when spatial_mode='ot_spatial'.
+            ot_block_size: Target spots per OT spatial grid tile.
+            ot_overlap_frac: Fractional spatial overlap between OT grid tiles.
+            ot_block_max_pairs: Optional hard cap for dense source-target pairs
+                in each OT sub-block. Defaults to None, preserving existing
+                block behavior.
+            ot_memory_budget_gb: Optional memory budget converted to an OT
+                sub-block pair cap. Defaults to None.
         """
         if self._model_params is None:
             raise ValueError("Model parameters not set. Call fit_model() first or provide model_params in constructor.")
@@ -364,6 +447,10 @@ class SpatialSimulator:
             random_seed=random_seed,
             spatial_mode=spatial_mode,
             target_adata=target_adata,
+            ot_block_size=ot_block_size,
+            ot_overlap_frac=ot_overlap_frac,
+            ot_block_max_pairs=ot_block_max_pairs,
+            ot_memory_budget_gb=ot_memory_budget_gb,
         )
         
         if verbose:
@@ -372,7 +459,7 @@ class SpatialSimulator:
         safe_calculate_qc_metrics(simulated_adata)
         return simulated_adata
 
-    def _apply_quantile_count_decoding(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, random_seed=None, spatial_mode='reference_rank', target_adata=None):
+    def _apply_quantile_count_decoding(self, reference_adata, model_params, verbose=True, clip_overshoot_factor=0.0, boundary_multiplier=1.1, random_seed=None, spatial_mode='reference_rank', target_adata=None, ot_block_size=40000, ot_overlap_frac=0.25, ot_block_max_pairs=None, ot_memory_budget_gb=None):
         """Generate counts from model parameters through rank-based count decoding."""
         from scipy.sparse import issparse
         reference_sparse = reference_adata.X if issparse(reference_adata.X) else None
@@ -384,6 +471,7 @@ class SpatialSimulator:
         seed = random_seed if random_seed is not None else diagnostics_seed
         if spatial_mode not in SPATIAL_MODES:
             raise ValueError(f"spatial_mode must be one of {SPATIAL_MODES}, got '{spatial_mode}'")
+        ot_pair_limit = _resolve_ot_block_max_pairs(ot_block_max_pairs, ot_memory_budget_gb)
 
         if spatial_mode == 'ot_spatial':
             if target_adata is None:
@@ -404,9 +492,18 @@ class SpatialSimulator:
             else:
                 clip_ref = reference_sparse if reference_sparse is not None else reference_matrix
 
-            if n_spots * n_target > MAX_DENSE_OT_PAIRS:
+            ot_pair_count = int(n_spots) * int(n_target)
+            if ot_pair_count > MAX_DENSE_OT_PAIRS or (
+                ot_pair_limit is not None and ot_pair_count > ot_pair_limit
+            ):
                 transported = _block_ot_transport(
-                    reference_matrix, source_coords, target_coords, reg=0.05
+                    reference_matrix,
+                    source_coords,
+                    target_coords,
+                    reg=0.05,
+                    block_size=ot_block_size,
+                    overlap_frac=ot_overlap_frac,
+                    max_block_pairs=ot_pair_limit,
                 )
                 spatial_coords = target_coords.copy()
                 n_spots = n_target
@@ -582,24 +679,49 @@ class SpatialSimulator:
             random_seed=kwargs.get("random_seed"),
             spatial_mode=kwargs.get("spatial_mode", "reference_rank"),
             target_adata=kwargs.get("target_adata"),
+            ot_block_size=kwargs.get("ot_block_size", 40000),
+            ot_overlap_frac=kwargs.get("ot_overlap_frac", 0.25),
+            ot_block_max_pairs=kwargs.get("ot_block_max_pairs"),
+            ot_memory_budget_gb=kwargs.get("ot_memory_budget_gb"),
         )
         simulated.uns["annotation_key"] = annotation_key
         return simulated
     
 
-def _block_ot_transport(reference_matrix, source_coords, target_coords, reg=0.05, block_size=40000, overlap_frac=0.25):
+def _block_ot_transport(
+    reference_matrix,
+    source_coords,
+    target_coords,
+    reg=0.05,
+    block_size=40000,
+    overlap_frac=0.25,
+    max_block_pairs=None,
+    memory_budget_gb=None,
+):
     """Block-based optimal transport for large datasets.
 
     Partitions target space into grid tiles, computes OT per tile with
     overlap, and assembles results.  Uncovered spots fall back to
     nearest-neighbour assignment.  Avoids the O(n^2) dense cost matrix
     that would OOM for Xenium-scale (> 100k spots) datasets.
+
+    ``max_block_pairs`` and ``memory_budget_gb`` are opt-in controls.  When
+    omitted, each grid tile is processed exactly as before.  When provided,
+    oversized tiles are recursively split before dense cost/Sinkhorn arrays
+    are allocated.
     """
     from ..de_novo._ot_transport import sinkhorn_transport
     from ..de_novo.quantile_field import midpoint_rank_normalize
 
     n_source = source_coords.shape[0]
     n_target = target_coords.shape[0]
+    block_size = int(block_size)
+    overlap_frac = float(overlap_frac)
+    if block_size < 1:
+        raise ValueError("ot_block_size must be a positive integer.")
+    if not np.isfinite(overlap_frac) or overlap_frac < 0:
+        raise ValueError("ot_overlap_frac must be a non-negative finite number.")
+    max_block_pairs = _resolve_ot_block_max_pairs(max_block_pairs, memory_budget_gb)
 
     ref_quantiles = midpoint_rank_normalize(reference_matrix, tie_policy='stable_ordinal', clip_eps=1e-6)
 
@@ -637,18 +759,32 @@ def _block_ot_transport(reference_matrix, source_coords, target_coords, reg=0.05
             if len(src_idx) < 5:
                 continue
 
-            cost = cdist(source_coords[src_idx], target_coords[tgt_idx], metric='euclidean')
-            a = np.ones(len(src_idx)) / n_source
-            b = np.ones(len(tgt_idx)) / n_target
+            for sub_src_idx, sub_tgt_idx in _iter_bounded_ot_subblocks(
+                src_idx,
+                tgt_idx,
+                source_coords,
+                target_coords,
+                max_block_pairs,
+            ):
+                if len(sub_tgt_idx) < 5 or len(sub_src_idx) < 5:
+                    continue
 
-            plan = sinkhorn_transport(M=cost, a=a, b=b, reg=reg)
+                cost = cdist(
+                    source_coords[sub_src_idx],
+                    target_coords[sub_tgt_idx],
+                    metric='euclidean',
+                )
+                a = np.ones(len(sub_src_idx)) / n_source
+                b = np.ones(len(sub_tgt_idx)) / n_target
 
-            col_mass = plan.sum(axis=0, keepdims=True)
-            safe_mass = np.where(col_mass > 1e-12, col_mass, 1.0)
-            transported_local = (plan / safe_mass).T @ ref_quantiles[src_idx, :]
+                plan = sinkhorn_transport(M=cost, a=a, b=b, reg=reg)
 
-            transported_accum[tgt_idx, :] += transported_local
-            count_accum[tgt_idx] += 1
+                col_mass = plan.sum(axis=0, keepdims=True)
+                safe_mass = np.where(col_mass > 1e-12, col_mass, 1.0)
+                transported_local = (plan / safe_mass).T @ ref_quantiles[sub_src_idx, :]
+
+                transported_accum[sub_tgt_idx, :] += transported_local
+                count_accum[sub_tgt_idx] += 1
 
     uncovered = count_accum == 0
     if np.any(uncovered):
@@ -666,7 +802,7 @@ def _block_ot_transport(reference_matrix, source_coords, target_coords, reg=0.05
     return transported
 
 
-def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, parameter_mode: str = 'hungarian', spatial_mode: str = 'reference_rank', target_adata=None, assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2, use_distributional_alteration: bool = False, ppf_method: str = 'interp', beta_n_jobs: int = 1, beta_early_stopping_patience: int = 2, assignment_solver: str = 'scipy', assignment_n_jobs: int = 1, assignment_blocks: bool = True, assignment_block_size: int = None, assignment_block_multiplier: int = 8, convert_n_jobs: int = 1) -> ad.AnnData:
+def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_simulation_cores: int = 12, verbose: bool = True, clip_overshoot_factor: float = 0.1, use_real_stats_directly: bool = False, annotation_key: str = None, use_heuristic_search: bool = False, min_accepted_error: float = 0.005, assignment_weights: dict = None, screening_pool_size: int = 1000, top_n_to_fully_evaluate: int = 10, n_jobs: int = -1, alteration_config=None, boundary_multiplier: float = 1.1, parameter_mode: str = 'hungarian', spatial_mode: str = 'reference_rank', target_adata=None, assignment_method: str = 'hybrid', random_seed: int = None, hybrid_alpha: float = 0.2, use_distributional_alteration: bool = False, ppf_method: str = 'interp', beta_n_jobs: int = 1, beta_early_stopping_patience: int = 2, assignment_solver: str = 'scipy', assignment_n_jobs: int = 1, assignment_blocks: bool = True, assignment_block_size: int = None, assignment_block_multiplier: int = 8, convert_n_jobs: int = 1, ot_block_size: int = 40000, ot_overlap_frac: float = 0.25, ot_block_max_pairs: int = None, ot_memory_budget_gb: float = None) -> ad.AnnData:
     """
     Run single-slice simulation.
 
@@ -685,6 +821,13 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
         assignment_blocks: use batched Hungarian (True, default) or full global (False).
         assignment_block_multiplier: candidates per gene in each batch (default 8).
         convert_n_jobs: parallel workers for count-model parameter conversion (1=sequential).
+        ot_block_size: Target spots per OT spatial grid tile.
+        ot_overlap_frac: Fractional spatial overlap between OT grid tiles.
+        ot_block_max_pairs: Optional hard cap for dense source-target pairs
+            in each OT sub-block. Defaults to None, preserving existing block
+            behavior.
+        ot_memory_budget_gb: Optional memory budget converted to an OT
+            sub-block pair cap. Defaults to None.
     """
     simulation_mode = _translate_parameter_mode(parameter_mode)
     spatial_mode = _translate_spatial_mode(spatial_mode)
@@ -739,6 +882,10 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
             boundary_multiplier=boundary_multiplier,
             alteration_config=alteration_config,
             target_adata=target_adata,
+            ot_block_size=ot_block_size,
+            ot_overlap_frac=ot_overlap_frac,
+            ot_block_max_pairs=ot_block_max_pairs,
+            ot_memory_budget_gb=ot_memory_budget_gb,
             **heuristic_kwargs, # Pass all heuristic controls
         )
 
@@ -766,6 +913,10 @@ def simulate_single_slice(adata: ad.AnnData, visualize_fits: bool = False, num_s
             random_seed=random_seed,
             spatial_mode=spatial_mode,
             target_adata=target_adata,
+            ot_block_size=ot_block_size,
+            ot_overlap_frac=ot_overlap_frac,
+            ot_block_max_pairs=ot_block_max_pairs,
+            ot_memory_budget_gb=ot_memory_budget_gb,
         )
         
     if verbose: print(f"\nSimulation completed successfully!")

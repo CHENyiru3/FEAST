@@ -178,11 +178,21 @@ class StudentTMixtureMarginalModeler:
                     from scipy.optimize import fsolve
                     sol, info, ier, msg = fsolve(
                         equation, x0, maxfev=1000, full_output=True)
-                    x_knots[i] = (max(sol[0], self.data_range[0])
-                                  if ier == 1 else np.interp(quantile, [0, 1], self.data_range))
+                    x_knots[i] = (
+                        max(sol[0], self.data_range[0])
+                        if ier == 1
+                        else np.interp(quantile, [0, 1], self.data_range)
+                    )
                 except Exception:
                     x_knots[i] = np.interp(quantile, [0, 1], self.data_range)
 
+        x_knots = np.nan_to_num(
+            x_knots,
+            nan=self.data_range[0],
+            neginf=self.data_range[0],
+            posinf=self.data_range[1],
+        )
+        x_knots = np.maximum(x_knots, self.data_range[0])
         self._ppf_interp = PchipInterpolator(q_knots, x_knots, extrapolate=True)
 
     def ppf(self, q):
@@ -196,6 +206,12 @@ class StudentTMixtureMarginalModeler:
                 self._build_ppf_interpolator()
             q_clipped = np.clip(q, 1e-10, 1.0 - 1e-10)
             out = self._ppf_interp(q_clipped)
+            out = np.nan_to_num(
+                out,
+                nan=self.data_range[0],
+                neginf=self.data_range[0],
+                posinf=self.data_range[1],
+            )
             out = np.maximum(out, self.data_range[0])
             return out
 

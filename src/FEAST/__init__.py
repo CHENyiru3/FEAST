@@ -36,7 +36,7 @@ from .modeling.marginal_alteration import AlterationConfig as _AlterationConfig
 from .de_novo.builder import simulate_from_design as _simulate_from_design
 from .de_novo.conditional import fit_reference as _fit_reference
 from .de_novo.conditional import simulate_from_reference as _simulate_from_reference
-from .de_novo.conditional import ReferenceFitConfig, SimulationConfig
+from .de_novo.conditional import ReferenceFitConfig, SimulationConfig, estimate_assignment_randomness
 from .de_novo.core import SliceBlueprint
 
 # ---------------------------------------------------------------------------
@@ -291,6 +291,7 @@ __all__ = [
     "SliceBlueprint",
     "ReferenceFitConfig",
     "SimulationConfig",
+    "estimate_assignment_randomness",
     # Functions
     "stats_to_theta",
     "theta_to_stats",
