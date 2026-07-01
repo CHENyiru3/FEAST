@@ -3,7 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.stats import t
 from sklearn.mixture import GaussianMixture
-from scipy.optimize import fsolve
+from scipy.optimize import brentq
 
 def _qqplot_2samples_manual(data1, data2, xlabel, ylabel, line, ax):
     data1 = np.asarray(data1)
@@ -116,7 +116,7 @@ class StudentTMixtureMarginalModeler:
         if not self._is_fitted:
             raise RuntimeError("Model must be fitted first")
         
-        x_processed = np.log10(np.asarray(x) + 1e-10) if self.log_transform else np.asarray(x)
+        x_processed = self._to_model_space(x)
         pdf = np.zeros_like(x_processed, dtype=float)
         
         for i in range(self.model_params['n_components']):
@@ -130,7 +130,32 @@ class StudentTMixtureMarginalModeler:
         if not self._is_fitted:
             raise RuntimeError("Model must be fitted first")
         
-        x_processed = np.log10(np.asarray(x) + 1e-10) if self.log_transform else np.asarray(x)
+        x_processed = self._to_model_space(x)
+        return self._cdf_model_space(x_processed)
+
+    def _to_model_space(self, x):
+        values = np.asarray(x, dtype=np.float64)
+        if not self.log_transform:
+            return values
+
+        processed = np.empty_like(values, dtype=np.float64)
+        nonnegative = values >= 0
+        processed[nonnegative] = np.log10(values[nonnegative] + 1e-10)
+        processed[~nonnegative] = -np.inf
+        return processed
+
+    def _from_model_space(self, x_processed):
+        values = np.asarray(x_processed, dtype=np.float64)
+        if not self.log_transform:
+            return values
+        with np.errstate(over='ignore', invalid='ignore'):
+            return np.maximum(np.power(10.0, values) - 1e-10, 0.0)
+
+    def _data_range_model_space(self):
+        return self._to_model_space(np.asarray(self.data_range, dtype=np.float64))
+
+    def _cdf_model_space(self, x_processed):
+        x_processed = np.asarray(x_processed, dtype=np.float64)
         cdf = np.zeros_like(x_processed, dtype=float)
         
         for i in range(self.model_params['n_components']):
@@ -139,15 +164,78 @@ class StudentTMixtureMarginalModeler:
                 loc=self.model_params['means'][i], 
                 scale=self.model_params['scales'][i])
         return cdf
+
+    def _ppf_model_space_scalar(self, quantile):
+        q = float(np.clip(quantile, 1e-12, 1.0 - 1e-12))
+        means = np.asarray(self.model_params['means'], dtype=np.float64)
+        scales = np.clip(np.asarray(self.model_params['scales'], dtype=np.float64), 1e-12, None)
+        dfs = np.asarray(self.model_params['dfs'], dtype=np.float64)
+
+        component_quantiles = t.ppf(q, df=dfs, loc=means, scale=scales)
+        finite = np.isfinite(component_quantiles)
+        if not np.any(finite):
+            return float(np.interp(q, [0.0, 1.0], self._data_range_model_space()))
+
+        lo = float(np.min(component_quantiles[finite]))
+        hi = float(np.max(component_quantiles[finite]))
+        if lo == hi:
+            return lo
+
+        def equation(x_processed):
+            return float(self._cdf_model_space(x_processed) - q)
+
+        step = max(float(np.max(scales)), 1.0)
+        f_lo = equation(lo)
+        f_hi = equation(hi)
+        for _ in range(50):
+            if f_lo <= 0.0 <= f_hi:
+                break
+            if f_lo > 0.0:
+                lo -= step
+                f_lo = equation(lo)
+            if f_hi < 0.0:
+                hi += step
+                f_hi = equation(hi)
+            step *= 2.0
+        else:
+            return float(np.interp(q, [0.0, 1.0], self._data_range_model_space()))
+
+        if f_lo == 0.0:
+            return lo
+        if f_hi == 0.0:
+            return hi
+        return float(brentq(equation, lo, hi, xtol=1e-12, rtol=1e-12, maxiter=100))
+
+    def _ppf_exact(self, q):
+        q = np.asarray(q, dtype=np.float64)
+        result_model_space = np.zeros_like(q, dtype=float)
+        data_min_model, data_max_model = self._data_range_model_space()
+
+        for i, quantile in enumerate(q.flatten()):
+            if quantile <= 0:
+                result_model_space.flat[i] = data_min_model
+            elif quantile >= 1:
+                result_model_space.flat[i] = data_max_model
+            else:
+                result_model_space.flat[i] = self._ppf_model_space_scalar(quantile)
+
+        result = self._from_model_space(result_model_space)
+        result = np.nan_to_num(
+            result,
+            nan=self.data_range[0],
+            neginf=self.data_range[0],
+            posinf=self.data_range[1],
+        )
+        result = np.maximum(result, self.data_range[0])
+        return result.reshape(q.shape)
     
     def _build_ppf_interpolator(self, n_fsolve: int = 400):
-        """Precompute PPF at strategic quantile knots via fsolve, then
+        """Precompute PPF at strategic quantile knots via bracketed solve, then
         interpolate with a monotone cubic spline.
 
-        Uses 400 precomputed fsolve evaluations distributed with extra
+        Uses 400 precomputed inverse-CDF evaluations distributed with extra
         density at the tails, then PchipInterpolator for fast vectorised
-        PPF.  This gives ~99.9% wall-time reduction vs scalar fsolve while
-        keeping relative error < 1e-3 across the quantile range.
+        PPF.
         """
         from scipy.interpolate import PchipInterpolator
 
@@ -161,30 +249,8 @@ class StudentTMixtureMarginalModeler:
         ]))
         q_knots = np.clip(q_knots, 1e-10, 1.0 - 1e-10)
 
-        # Evaluate ppf at knots via fsolve (old scalar method)
-        x_knots = np.empty_like(q_knots)
-        for i, quantile in enumerate(q_knots):
-            if quantile <= 1e-10:
-                x_knots[i] = self.data_range[0]
-            elif quantile >= 1.0 - 1e-10:
-                x_knots[i] = self.data_range[1]
-            else:
-                def equation(x):
-                    return self.cdf(x) - quantile
-
-                x0 = (10 ** self.model_params['means'][0]
-                      if self.log_transform else self.model_params['means'][0])
-                try:
-                    from scipy.optimize import fsolve
-                    sol, info, ier, msg = fsolve(
-                        equation, x0, maxfev=1000, full_output=True)
-                    x_knots[i] = (
-                        max(sol[0], self.data_range[0])
-                        if ier == 1
-                        else np.interp(quantile, [0, 1], self.data_range)
-                    )
-                except Exception:
-                    x_knots[i] = np.interp(quantile, [0, 1], self.data_range)
+        # Evaluate PPF in the fitted mixture space, then back-transform once.
+        x_knots = self._ppf_exact(q_knots)
 
         x_knots = np.nan_to_num(
             x_knots,
@@ -193,6 +259,7 @@ class StudentTMixtureMarginalModeler:
             posinf=self.data_range[1],
         )
         x_knots = np.maximum(x_knots, self.data_range[0])
+        x_knots = np.maximum.accumulate(x_knots)
         self._ppf_interp = PchipInterpolator(q_knots, x_knots, extrapolate=True)
 
     def ppf(self, q):
@@ -215,26 +282,7 @@ class StudentTMixtureMarginalModeler:
             out = np.maximum(out, self.data_range[0])
             return out
 
-        # exact: scalar fsolve per quantile
-        result = np.zeros_like(q, dtype=float)
-        for i, quantile in enumerate(q.flatten()):
-            if quantile <= 0:
-                result.flat[i] = self.data_range[0]
-            elif quantile >= 1:
-                result.flat[i] = self.data_range[1]
-            else:
-                def equation(x):
-                    return self.cdf(x) - quantile
-
-                x0 = 10 ** self.model_params['means'][0] if self.log_transform else self.model_params['means'][0]
-                try:
-                    sol, info, ier, msg = fsolve(equation, x0, maxfev=1000, full_output=True)
-                    if ier != 1:
-                        raise RuntimeError(f"fsolve did not converge: {msg}")
-                    result.flat[i] = max(sol[0], self.data_range[0])
-                except Exception:
-                    result.flat[i] = np.interp(quantile, [0, 1], self.data_range)
-        return result.reshape(q.shape)
+        return self._ppf_exact(q)
     
     def sample(self, n_samples):
         if not self._is_fitted:
