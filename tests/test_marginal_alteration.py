@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from FEAST.modeling.StudentT_mixture_model import StudentTMixtureMarginalModeler
 from FEAST.modeling.marginal_alteration import AlterationConfig, alter_marginal_model
@@ -27,6 +28,33 @@ def test_interpolated_studentt_ppf_refreshes_after_mean_alteration():
 
     np.testing.assert_allclose(after[1:3] / before[1:3], 2.0, rtol=0.15)
     assert after[-1] > model.data_range[1]
+
+
+def _two_component_log_space_studentt(ppf_method):
+    model = StudentTMixtureMarginalModeler(max_components=2, ppf_method=ppf_method)
+    model._is_fitted = True
+    model.log_transform = True
+    model.data_range = (1e-3, 1e3)
+    model.model_params = {
+        "n_components": 2,
+        "weights": np.array([0.5, 0.5]),
+        "means": np.array([1.5, -1.5]),
+        "scales": np.array([0.2, 0.2]),
+        "dfs": np.array([5.0, 5.0]),
+    }
+    return model
+
+
+@pytest.mark.parametrize("ppf_method", ["exact", "interp"])
+def test_studentt_log_transform_ppf_is_monotone_in_original_space(ppf_method):
+    model = _two_component_log_space_studentt(ppf_method)
+
+    quantiles = np.array([0.01, 0.1, 0.5, 0.9, 0.99])
+    values = model.ppf(quantiles)
+
+    assert np.all(np.isfinite(values))
+    assert np.all(np.diff(values) > 0)
+    np.testing.assert_allclose(model.cdf(values), quantiles, atol=5e-3)
 
 
 def test_deprecated_sparsity_fold_change_maps_to_logit_shift():
