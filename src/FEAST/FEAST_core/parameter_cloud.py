@@ -18,6 +18,8 @@ from ..modeling.marginal_alteration import alter_marginal_model, AlterationConfi
 
 STAT_COLUMNS = ['mean', 'variance', 'zero_prop']
 SIMULATION_MODES = ('generative', 'empirical')
+ASSIGNMENT_FEATURE_CLIP = 1e6
+ASSIGNMENT_COST_CLIP = 1e12
 
 
 def _solve_assignment(cost_matrix: np.ndarray, assignment_solver: str = 'scipy'):
@@ -48,6 +50,33 @@ def _solve_assignment(cost_matrix: np.ndarray, assignment_solver: str = 'scipy')
             warnings.warn("lap package not installed, falling back to scipy solver.")
     # Default: scipy (modified Jonker-Volgenant)
     return linear_sum_assignment(cost_matrix)
+
+
+def _bounded_assignment_features(values, dtype=np.float64):
+    """Return finite standardized features for distance calculations."""
+    arr = np.asarray(values, dtype=np.float64)
+    arr = np.nan_to_num(
+        arr,
+        nan=0.0,
+        posinf=ASSIGNMENT_FEATURE_CLIP,
+        neginf=-ASSIGNMENT_FEATURE_CLIP,
+    )
+    arr = np.clip(arr, -ASSIGNMENT_FEATURE_CLIP, ASSIGNMENT_FEATURE_CLIP)
+    return arr.astype(dtype, copy=False)
+
+
+def _finite_assignment_cost(cost_matrix):
+    """Replace non-finite distances with a large finite penalty."""
+    cost = np.asarray(cost_matrix)
+    finite = np.isfinite(cost)
+    if np.all(finite):
+        return cost
+
+    replacement = ASSIGNMENT_COST_CLIP
+    if np.any(finite):
+        max_finite = float(np.max(cost[finite]))
+        replacement = min(max(max_finite * 10.0, 1.0), ASSIGNMENT_COST_CLIP)
+    return np.nan_to_num(cost, nan=replacement, posinf=replacement, neginf=replacement)
 
 def to_uniform(series):
     return rankdata(series, method='ordinal') / (len(series) + 1)
@@ -419,17 +448,26 @@ class GeneParameterSimulator:
             w = np.array([weights['mean'], weights['variance'], weights['zero_prop']], dtype=np.float64)
 
             scaler_log = StandardScaler()
-            orig_log = scaler_log.fit_transform(np.log10(np.clip(orig_arr64, eps, None)))
-            synth_log = scaler_log.transform(np.log10(np.clip(synth_arr64, eps, None)))
-            cost_log = cdist(orig_log * w, synth_log * w, 'euclidean')
+            orig_log = _bounded_assignment_features(
+                scaler_log.fit_transform(np.log10(np.clip(orig_arr64, eps, None)))
+            ) * w
+            synth_log = _bounded_assignment_features(
+                scaler_log.transform(np.log10(np.clip(synth_arr64, eps, None)))
+            ) * w
+            cost_log = _finite_assignment_cost(cdist(orig_log, synth_log, 'euclidean'))
 
             scaler_raw = StandardScaler()
-            orig_raw = scaler_raw.fit_transform(np.clip(orig_arr64, 0, None))
-            synth_raw = scaler_raw.transform(np.clip(synth_arr64, 0, None))
-            cost_raw = cdist(orig_raw * w, synth_raw * w, 'euclidean')
+            orig_raw = _bounded_assignment_features(
+                scaler_raw.fit_transform(np.clip(orig_arr64, 0, None))
+            ) * w
+            synth_raw = _bounded_assignment_features(
+                scaler_raw.transform(np.clip(synth_arr64, 0, None))
+            ) * w
+            cost_raw = _finite_assignment_cost(cdist(orig_raw, synth_raw, 'euclidean'))
 
             norm = max(float(cost_log.mean()), float(cost_raw.mean()), eps)
             cost_matrix = hybrid_alpha * (cost_log / norm) + (1 - hybrid_alpha) * (cost_raw / norm)
+            cost_matrix = _finite_assignment_cost(cost_matrix)
             row_ind, col_ind = _solve_assignment(cost_matrix, assignment_solver)
 
             if verbose:
@@ -448,25 +486,29 @@ class GeneParameterSimulator:
         synth_arr = np.clip(synth_arr64, -f32_max, f32_max).astype(np.float32, copy=False)
 
         scaler_log = StandardScaler()
-        orig_log = scaler_log.fit_transform(
-            np.log10(np.clip(orig_arr, eps, None))
-        ).astype(np.float32) * w
-        synth_log = scaler_log.transform(
-            np.log10(np.clip(synth_arr, eps, None))
-        ).astype(np.float32) * w
+        orig_log = _bounded_assignment_features(
+            scaler_log.fit_transform(np.log10(np.clip(orig_arr, eps, None))),
+            dtype=np.float32,
+        ) * w
+        synth_log = _bounded_assignment_features(
+            scaler_log.transform(np.log10(np.clip(synth_arr, eps, None))),
+            dtype=np.float32,
+        ) * w
 
         scaler_raw = StandardScaler()
-        orig_raw = scaler_raw.fit_transform(
-            np.clip(orig_arr, 0, None)
-        ).astype(np.float32) * w
-        synth_raw = scaler_raw.transform(
-            np.clip(synth_arr, 0, None)
-        ).astype(np.float32) * w
+        orig_raw = _bounded_assignment_features(
+            scaler_raw.fit_transform(np.clip(orig_arr, 0, None)),
+            dtype=np.float32,
+        ) * w
+        synth_raw = _bounded_assignment_features(
+            scaler_raw.transform(np.clip(synth_arr, 0, None)),
+            dtype=np.float32,
+        ) * w
 
         # Estimate norm from a small sample
         sample_n = min(n_genes, 200)
-        s_log = cdist(orig_log[:sample_n], synth_log, 'euclidean')
-        s_raw = cdist(orig_raw[:sample_n], synth_raw, 'euclidean')
+        s_log = _finite_assignment_cost(cdist(orig_log[:sample_n], synth_log, 'euclidean'))
+        s_raw = _finite_assignment_cost(cdist(orig_raw[:sample_n], synth_raw, 'euclidean'))
         norm = max(float(s_log.mean()), float(s_raw.mean()), eps)
         del s_log, s_raw
 
@@ -505,9 +547,10 @@ class GeneParameterSimulator:
             b_orig_raw = orig_raw[b_start:b_end]
             b_synth_log = synth_log[cand_idx]
             b_synth_raw = synth_raw[cand_idx]
-            c_log = cdist(b_orig_log, b_synth_log, 'euclidean')
-            c_raw = cdist(b_orig_raw, b_synth_raw, 'euclidean')
+            c_log = _finite_assignment_cost(cdist(b_orig_log, b_synth_log, 'euclidean'))
+            c_raw = _finite_assignment_cost(cdist(b_orig_raw, b_synth_raw, 'euclidean'))
             cost_batch = (alpha_f * c_log + alpha_r * c_raw) * inv_norm
+            cost_batch = _finite_assignment_cost(cost_batch)
 
             row_ind, col_ind = _solve_assignment(cost_batch, assignment_solver)
             assigned_set = {cand_idx[c] for c in col_ind}
